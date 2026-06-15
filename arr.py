@@ -21,9 +21,13 @@ import urllib.request
 ENV_FILE = os.environ.get("ARR_ENV_FILE", "/run/secrets/rendered/arr-cli.env")
 
 SERVICES = {
-    "sonarr":   {"port": 8989, "ver": "v3", "key": "SONARR_API_KEY"},
-    "radarr":   {"port": 7878, "ver": "v3", "key": "RADARR_API_KEY"},
-    "prowlarr": {"port": 9696, "ver": "v1", "key": "PROWLARR_API_KEY"},
+    "sonarr":       {"port": 8989, "ver": "v3", "key": "SONARR_API_KEY"},
+    # Dedicated anime Sonarr instance (nixflix.sonarr-anime). Same v3 series API
+    # as sonarr — every sonarr command works against it; series logic keys off
+    # svc.startswith("sonarr"), so this is treated as a series (not movie) svc.
+    "sonarr-anime": {"port": 8990, "ver": "v3", "key": "SONARR_ANIME_API_KEY"},
+    "radarr":       {"port": 7878, "ver": "v3", "key": "RADARR_API_KEY"},
+    "prowlarr":     {"port": 9696, "ver": "v1", "key": "PROWLARR_API_KEY"},
 }
 
 # SABnzbd is not a *arr; its HTTP API is ?mode=...&apikey=... on port 8085.
@@ -174,7 +178,7 @@ def resolve_id(svc, q):
     """numeric -> int; title substring -> unique id (or list candidates & die)."""
     if str(q).isdigit():
         return int(q)
-    coll = "series" if svc == "sonarr" else "movie"
+    coll = "series" if svc.startswith("sonarr") else "movie"
     items = api(svc, "GET", "/" + coll)
     ql = q.lower()
     hits = []
@@ -214,7 +218,7 @@ def pop_flags(args, spec):
 # --- commands ----------------------------------------------------------------
 def cmd_status(svc, args):
     q = (args[0].lower() if args else "")
-    if svc == "sonarr":
+    if svc.startswith("sonarr"):
         items = sorted(api(svc, "GET", "/series"), key=lambda x: x["title"])
         for s in items:
             if q and q not in s["title"].lower():
@@ -238,12 +242,12 @@ def cmd_status(svc, args):
 def cmd_get(svc, args):
     if not args:
         die("get: need an id or query")
-    coll = "series" if svc == "sonarr" else "movie"
+    coll = "series" if svc.startswith("sonarr") else "movie"
     print(json.dumps(api(svc, "GET", "/%s/%d" % (coll, resolve_id(svc, args[0]))), indent=2))
 
 
 def cmd_seasons(svc, args):
-    if svc != "sonarr":
+    if not svc.startswith("sonarr"):
         die("seasons: sonarr only")
     s = api(svc, "GET", "/series/%d" % resolve_id(svc, args[0]))
     print(s["title"])
@@ -258,7 +262,7 @@ def _release_query(svc, args):
     flags, rest = pop_flags(args, {"--season": 1, "--episode": 1})
     if not rest:
         die("need an id or query")
-    if svc == "sonarr":
+    if svc.startswith("sonarr"):
         sid = resolve_id(svc, rest[0])
         if "--episode" in flags:
             return "episodeId=%s" % flags["--episode"]
@@ -392,7 +396,7 @@ def cmd_grab(svc, args):
 
     if not override:
         # let the arr search & decide (respects the quality profile)
-        if svc == "sonarr":
+        if svc.startswith("sonarr"):
             sid = resolve_id(svc, rest[0])
             if "--episode" in flags:
                 body = {"name": "EpisodeSearch", "episodeIds": [int(flags["--episode"])]}
@@ -461,7 +465,7 @@ def cmd_monitor(svc, args):
 
 
 def _queue_records(svc, page_size=1000):
-    if svc == "sonarr":
+    if svc.startswith("sonarr"):
         extra = "includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
     else:
         extra = "includeUnknownMovieItems=true&includeMovie=true"
@@ -544,7 +548,7 @@ def cmd_stuck(svc, args):
 def cmd_history(svc, args):
     if args:
         hid = resolve_id(svc, args[0])
-        if svc == "sonarr":
+        if svc.startswith("sonarr"):
             rows = api(svc, "GET", "/history/series?seriesId=%d" % hid) or []
             rows = sorted(rows, key=lambda x: x["date"], reverse=True)[:20]
         else:
@@ -558,7 +562,7 @@ def cmd_history(svc, args):
 
 
 def cmd_wanted(svc, args):
-    sortk = "airDateUtc" if svc == "sonarr" else "title"
+    sortk = "airDateUtc" if svc.startswith("sonarr") else "title"
     data = api(svc, "GET", "/wanted/missing?pageSize=50&sortKey=%s&sortDirection=descending" % sortk)
     print("missing: %d" % data["totalRecords"])
     for r in data["records"][:40]:
@@ -683,22 +687,22 @@ def cmd_import(svc, args):
     SAFETY: a folder may hold files from many shows. --match restricts to files
     whose name contains SUBSTR (case-insensitive). Without it, EVERY file under
     the folder is mapped onto this series — only safe for a single-show folder."""
-    if svc != "sonarr":
+    if not svc.startswith("sonarr"):
         die("import: sonarr only")
     flags, rest = pop_flags(args, {"--series": 1, "--match": 1, "--season": 1,
                                    "--map": 1, "--mode": 1, "--dry-run": 0})
     if not rest or "--series" not in flags:
         die("import: usage: arr sonarr import <folder> --series <id|query> "
             "[--match SUBSTR] [--season N] [--map auto|abs|se] [--mode copy|move] [--dry-run]")
-    sid = resolve_id("sonarr", flags["--series"])
+    sid = resolve_id(svc, flags["--series"])
     match = (flags.get("--match") or "").lower()
     mapmode = flags.get("--map", "auto")
     season = int(flags["--season"]) if "--season" in flags else None
     impmode = flags.get("--mode", "copy")
-    files = api("sonarr", "GET",
+    files = api(svc, "GET",
                 "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(rest[0]),
                 timeout=SEARCH_TIMEOUT)
-    eps = api("sonarr", "GET", "/episode?seriesId=%d" % sid)
+    eps = api(svc, "GET", "/episode?seriesId=%d" % sid)
     by_se = {(e["seasonNumber"], e["episodeNumber"]): e for e in eps}
     by_abs = {e["absoluteEpisodeNumber"]: e for e in eps if e.get("absoluteEpisodeNumber")}
     payload, skipped = [], []
@@ -727,7 +731,7 @@ def cmd_import(svc, args):
     if "--dry-run" in flags:
         print("DRY: would ManualImport %d file(s) [mode=%s]" % (len(payload), impmode))
         return
-    r = api("sonarr", "POST", "/command",
+    r = api(svc, "POST", "/command",
             {"name": "ManualImport", "importMode": impmode, "files": payload})
     print("ManualImport queued: id=%s status=%s (%d files)" % (
         r.get("id"), r.get("status"), len(payload)))
@@ -853,9 +857,9 @@ def cmd_files(svc, args):
     flags, rest = pop_flags(args, {"--full": 0})
     if not rest:
         die("files: need an id or query")
-    if svc == "sonarr":
-        sid = resolve_id("sonarr", rest[0])
-        files = api("sonarr", "GET", "/episodefile?seriesId=%d" % sid) or []
+    if svc.startswith("sonarr"):
+        sid = resolve_id(svc, rest[0])
+        files = api(svc, "GET", "/episodefile?seriesId=%d" % sid) or []
         by_season = {}
         for f in files:
             by_season.setdefault(f["seasonNumber"], []).append(f)
@@ -884,17 +888,17 @@ def cmd_delete(svc, args):
         die("delete: need an id or query")
     go = "--yes" in flags
     tag = "" if go else "[dry-run] "
-    if svc == "sonarr":
-        sid = resolve_id("sonarr", rest[0])
-        s = api("sonarr", "GET", "/series/%d" % sid)
-        allfiles = api("sonarr", "GET", "/episodefile?seriesId=%d" % sid) or []
+    if svc.startswith("sonarr"):
+        sid = resolve_id(svc, rest[0])
+        s = api(svc, "GET", "/series/%d" % sid)
+        allfiles = api(svc, "GET", "/episodefile?seriesId=%d" % sid) or []
         if "--all" in flags:
             print("%sDELETE SERIES '%s' + %d file(s) (%sGB)" % (
                 tag, s["title"], len(allfiles), gb(sum(f.get("size", 0) for f in allfiles))))
             if not go:
                 print("  (pass --yes to delete)")
                 return
-            api("sonarr", "DELETE", "/series/%d?deleteFiles=true" % sid)
+            api(svc, "DELETE", "/series/%d?deleteFiles=true" % sid)
             print("deleted series + files")
             return
         if "--seasons" not in flags:
@@ -913,12 +917,12 @@ def cmd_delete(svc, args):
             return
         ids = [f["id"] for f in files]
         if ids:
-            api("sonarr", "DELETE", "/episodefile/bulk", {"episodeFileIds": ids})
+            api(svc, "DELETE", "/episodefile/bulk", {"episodeFileIds": ids})
         if unmon:
             for se in s["seasons"]:
                 if se["seasonNumber"] in want:
                     se["monitored"] = False
-            api("sonarr", "PUT", "/series/%d" % sid, s)
+            api(svc, "PUT", "/series/%d" % sid, s)
         print("deleted %d file(s)%s" % (len(ids), " + unmonitored" if unmon else ""))
     else:
         mid = resolve_id("radarr", rest[0])
@@ -995,7 +999,7 @@ def cmd_availability(svc, args):
     titles + imdb/tmdb ids (no guessing romanizations), reports found/unavailable."""
     if not args:
         die("availability: need an id or query")
-    coll = "series" if svc == "sonarr" else "movie"
+    coll = "series" if svc.startswith("sonarr") else "movie"
     iid = resolve_id(svc, args[0])
     item = api(svc, "GET", "/%s/%d" % (coll, iid))
     year = item.get("year")
@@ -1023,7 +1027,7 @@ def cmd_lookup(svc, args):
     """Search TMDB/TVDB metadata for a title (disambiguate, e.g. 1990 vs 2003)."""
     if not args:
         die("lookup: need a search term")
-    coll = "series" if svc == "sonarr" else "movie"
+    coll = "series" if svc.startswith("sonarr") else "movie"
     res = api(svc, "GET", "/%s/lookup?term=%s" % (coll, urllib.parse.quote(" ".join(args))))
     for it in (res or [])[:12]:
         ids = "tmdb=%s imdb=%s" % (it.get("tmdbId"), it.get("imdbId"))
@@ -1039,7 +1043,7 @@ def cmd_info(svc, args):
     """Concise identity for an item (title/year/ids/originalTitle/altTitles/state)."""
     if not args:
         die("info: need an id or query")
-    coll = "series" if svc == "sonarr" else "movie"
+    coll = "series" if svc.startswith("sonarr") else "movie"
     iid = resolve_id(svc, args[0])
     it = api(svc, "GET", "/%s/%d" % (coll, iid))
     print("%s (%s)" % (it.get("title"), it.get("year")))
@@ -1053,7 +1057,7 @@ def cmd_info(svc, args):
     if alts:
         print("  altTitles: %s" % ", ".join(alts[:12]))
     st = it.get("statistics") or {}
-    if svc == "sonarr":
+    if svc.startswith("sonarr"):
         disk = "%d/%d eps, %sGB" % (st.get("episodeFileCount", 0), st.get("totalEpisodeCount", 0), gb(st.get("sizeOnDisk")))
     else:
         disk = ("ON DISK %sGB" % gb(it.get("sizeOnDisk"))) if it.get("hasFile") else "no file"
@@ -1128,7 +1132,9 @@ COMMANDS = {
 USAGE = """arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
 
   arr <service> <command> [args]
-  service: sonarr | radarr | prowlarr | sab | jellyfin | seerr
+  service: sonarr | sonarr-anime | radarr | prowlarr | sab | jellyfin | seerr
+  (sonarr-anime = the dedicated anime Sonarr on :8990; all sonarr commands work
+   against it, e.g. `arr sonarr-anime status`, `arr sonarr-anime seasons <show>`)
 
 Commands (sonarr & radarr unless noted):
   status [query]                  list items (optionally filter by title)
@@ -1205,7 +1211,7 @@ def main(argv):
         fn(argv[2:])
         return
     if svc not in SERVICES:
-        die("unknown service '%s' (want sonarr|radarr|prowlarr|sab|jellyfin|seerr)" % svc)
+        die("unknown service '%s' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr)" % svc)
     if len(argv) < 2:
         print(USAGE)
         sys.exit(1)
