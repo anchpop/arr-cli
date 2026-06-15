@@ -460,13 +460,46 @@ def cmd_monitor(svc, args):
     print("updated %s: %s" % (s["title"], on))
 
 
-def cmd_queue(svc, args):
-    pat = args[0].lower() if args else None
+def _queue_records(svc, page_size=1000):
     if svc == "sonarr":
-        extra = "includeUnknownSeriesItems=true&includeSeries=true"
+        extra = "includeUnknownSeriesItems=true&includeSeries=true&includeEpisode=true"
     else:
         extra = "includeUnknownMovieItems=true&includeMovie=true"
-    q = api(svc, "GET", "/queue?pageSize=200&" + extra)
+    return api(svc, "GET", "/queue?pageSize=%d&%s" % (page_size, extra))
+
+
+def _queue_status_messages(r):
+    return [m for sm in (r.get("statusMessages") or []) for m in sm.get("messages", [])]
+
+
+def _is_stuck_queue_record(r):
+    status = r.get("status")
+    state = r.get("trackedDownloadState")
+    return (
+        status == "failed"
+        or state in ("importBlocked", "importPending")
+        or bool(r.get("errorMessage"))
+    )
+
+
+def _queue_record_summary(r):
+    return {
+        "id": r.get("id"),
+        "title": r.get("title"),
+        "status": r.get("status"),
+        "trackedDownloadStatus": r.get("trackedDownloadStatus"),
+        "trackedDownloadState": r.get("trackedDownloadState"),
+        "sizeleftMb": mb(r.get("sizeleft")),
+        "downloadId": r.get("downloadId"),
+        "outputPath": r.get("outputPath"),
+        "errorMessage": r.get("errorMessage"),
+        "statusMessages": _queue_status_messages(r),
+    }
+
+
+def cmd_queue(svc, args):
+    pat = args[0].lower() if args else None
+    q = _queue_records(svc, page_size=200)
     print("queue: %d item(s)%s" % (q["totalRecords"], (" matching '%s'" % args[0]) if pat else ""))
     for r in q["records"]:
         if pat and pat not in (r.get("title", "").lower()):
@@ -475,7 +508,35 @@ def cmd_queue(svc, args):
             r.get("status"), r.get("trackedDownloadState"), mb(r.get("sizeleft")), r.get("title")))
         if r.get("errorMessage"):
             print("        err: " + r["errorMessage"])
-        msgs = [m for sm in (r.get("statusMessages") or []) for m in sm.get("messages", [])]
+        msgs = _queue_status_messages(r)
+        if msgs:
+            print("        " + "; ".join(msgs))
+
+
+def cmd_stuck(svc, args):
+    """Show only queue items that need intervention: failed/import blocked/pending."""
+    flags, rest = pop_flags(args, {"--json": 0, "--quiet": 0})
+    pat = rest[0].lower() if rest else None
+    q = _queue_records(svc, page_size=1000)
+    rows = []
+    for r in q["records"]:
+        if pat and pat not in (r.get("title", "").lower()):
+            continue
+        if _is_stuck_queue_record(r):
+            rows.append(r)
+    if "--json" in flags:
+        print(json.dumps([_queue_record_summary(r) for r in rows], indent=2))
+        return
+    if rows:
+        print("stuck: %d %s queue item(s)%s" % (len(rows), svc, (" matching '%s'" % rest[0]) if pat else ""))
+    elif "--quiet" not in flags:
+        print("stuck: 0 %s queue item(s)%s" % (svc, (" matching '%s'" % rest[0]) if pat else ""))
+    for r in rows:
+        print("  %s/%s  %sMB left  %s" % (
+            r.get("status"), r.get("trackedDownloadState"), mb(r.get("sizeleft")), r.get("title")))
+        if r.get("errorMessage"):
+            print("        err: " + r["errorMessage"])
+        msgs = _queue_status_messages(r)
         if msgs:
             print("        " + "; ".join(msgs))
 
@@ -1057,7 +1118,7 @@ JELLYFIN_COMMANDS = {"unwatched": cmd_jf_unwatched}
 COMMANDS = {
     "status": cmd_status, "get": cmd_get, "seasons": cmd_seasons,
     "releases": cmd_releases, "grab": cmd_grab, "monitor": cmd_monitor,
-    "queue": cmd_queue, "history": cmd_history, "wanted": cmd_wanted,
+    "queue": cmd_queue, "stuck": cmd_stuck, "history": cmd_history, "wanted": cmd_wanted,
     "parse": cmd_parse, "search": cmd_search, "import": cmd_import,
     "files": cmd_files, "delete": cmd_delete,
     "availability": cmd_availability, "lookup": cmd_lookup, "info": cmd_info,
@@ -1092,7 +1153,9 @@ Commands (sonarr & radarr unless noted):
         force-import files into episodes, bypassing name matching (maps by
         absolute/SxxExx number). --match filters filenames (USE IT in a shared
         download folder, or every file gets mapped onto this series).
-  queue | history [id|query] | wanted
+  queue [query]                    show download queue
+  stuck [query] [--json|--quiet]   queue items needing intervention (failed/import-blocked/pending)
+  history [id|query] | wanted
   search <query> [--group X] [--indexer Y] [--limit N] [--json]   (prowlarr)
   grab <query> [--indexer X] [--group/--match Y] [--cat C] [--all] [--dry-run]
         (prowlarr) grab a matched release to the right client by protocol:
