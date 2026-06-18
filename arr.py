@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -367,7 +368,8 @@ def cmd_grab(svc, args):
     if svc == "prowlarr":
         return cmd_prowlarr_grab(args)
     flags, rest = pop_flags(args, {"--season": 1, "--episode": 1,
-                                   "--override": 0, "--via-sab": 0, "--dry-run": 0})
+                                   "--override": 0, "--via-sab": 0, "--dry-run": 0,
+                                   "--wait": 0, "--timeout": 1})
     if not rest:
         die("grab: need an id or query")
     override, dry = "--override" in flags, "--dry-run" in flags
@@ -411,6 +413,9 @@ def cmd_grab(svc, args):
             return
         r = api(svc, "POST", "/command", body)
         print("queued %s (command id %s, status %s)" % (r["commandName"], r["id"], r["status"]))
+        if "--wait" in flags:
+            rec = _wait_command(svc, r["id"], timeout=int(flags.get("--timeout", 300)))
+            print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
         return
 
     # --override: force-push every candidate release, bypassing rejections
@@ -543,6 +548,118 @@ def cmd_stuck(svc, args):
         msgs = _queue_status_messages(r)
         if msgs:
             print("        " + "; ".join(msgs))
+
+
+def _wait_command(svc, cmd_id, timeout=300, interval=3):
+    """Poll /command/<id> until it leaves queued/started; return the final record.
+
+    Replaces the `for i in seq…; sleep 5; raw GET /command/<id>` poll loops."""
+    start = time.time()
+    while True:
+        rec = api(svc, "GET", "/command/%d" % int(cmd_id))
+        if rec.get("status") not in ("queued", "started"):
+            return rec
+        if time.time() - start > timeout:
+            return rec  # caller inspects .status (still queued/started == timed out)
+        time.sleep(interval)
+
+
+def cmd_wait(svc, args):
+    """Block until an arr command (search/grab/import/refresh/rename) finishes.
+
+    arr <svc> wait <commandId> [--timeout SECONDS]
+    Command ids come from `grab`, `import`, or any `raw POST /command`. Exits
+    non-zero unless the command reached 'completed'."""
+    flags, rest = pop_flags(args, {"--timeout": 1})
+    if not rest:
+        die("wait: need a command id (e.g. printed by `arr <svc> grab/import`)")
+    rec = _wait_command(svc, rest[0], timeout=int(flags.get("--timeout", 300)))
+    st = rec.get("status")
+    name = rec.get("commandName") or rec.get("name") or ("command %s" % rest[0])
+    print("%s: %s%s" % (name, st, ("  " + rec["message"]) if rec.get("message") else ""))
+    if rec.get("exception"):
+        print("  exception: " + str(rec["exception"])[:300])
+    if st != "completed":
+        sys.exit(2)
+
+
+def cmd_episodes(svc, args):
+    """List a series' episodes WITH ids — what you need to grab/import by episode.
+
+    arr <svc> episodes <id|query> [--season N] [--missing] [--monitored] [--json]
+    Columns: epId  SxxEyy  abs=ABS  ON/OFF(file)  m/-(monitored)  title
+    Replaces `raw GET /episode?seriesId=N | jq …` for finding missing-ep ids."""
+    if not svc.startswith("sonarr"):
+        die("episodes: sonarr only")
+    flags, rest = pop_flags(args, {"--season": 1, "--missing": 0,
+                                   "--monitored": 0, "--json": 0})
+    if not rest:
+        die("episodes: need a series id or query")
+    sid = resolve_id(svc, rest[0])
+    eps = api(svc, "GET", "/episode?seriesId=%d" % sid)
+    season = int(flags["--season"]) if "--season" in flags else None
+    rows = []
+    for e in eps:
+        if season is not None and e.get("seasonNumber") != season:
+            continue
+        if "--missing" in flags and e.get("hasFile"):
+            continue
+        if "--monitored" in flags and not e.get("monitored"):
+            continue
+        rows.append(e)
+    rows.sort(key=lambda e: (e.get("seasonNumber") or 0, e.get("episodeNumber") or 0))
+    if "--json" in flags:
+        print(json.dumps([{
+            "id": e["id"], "season": e.get("seasonNumber"),
+            "episode": e.get("episodeNumber"), "abs": e.get("absoluteEpisodeNumber"),
+            "hasFile": e.get("hasFile"), "monitored": e.get("monitored"),
+            "title": e.get("title"),
+        } for e in rows], indent=2))
+        return
+    label = " (missing)" if "--missing" in flags else ""
+    print("%d episode(s)%s:" % (len(rows), label))
+    for e in rows:
+        print("  %-7d S%02dE%02d  abs=%-4s %s %s  %s" % (
+            e["id"], e.get("seasonNumber") or 0, e.get("episodeNumber") or 0,
+            e.get("absoluteEpisodeNumber") or "-",
+            "ON " if e.get("hasFile") else "OFF",
+            "m" if e.get("monitored") else "-",
+            e.get("title", "")))
+
+
+def cmd_queue_rm(svc, args):
+    """Remove queue record(s) by id or title pattern — the API way, no raw curl.
+
+    arr <svc> queue-rm <id|pattern> [--blocklist] [--keep-files] [--yes]
+    Default also removes the download from the client (removeFromClient=true);
+    --keep-files leaves it. --blocklist makes the arr avoid re-grabbing the same
+    release. Dry-run unless --yes. Pairs with `stuck` for clearing dead items."""
+    flags, rest = pop_flags(args, {"--blocklist": 0, "--keep-files": 0, "--yes": 0})
+    if not rest:
+        die("queue-rm: need a queue id or title pattern")
+    if rest[0].isdigit():
+        targets = [{"id": int(rest[0]), "title": "(queue id %s)" % rest[0]}]
+    else:
+        pat = rest[0].lower()
+        q = _queue_records(svc, page_size=1000)
+        targets = [{"id": r["id"], "title": r.get("title", "")}
+                   for r in q["records"] if pat in (r.get("title", "").lower())]
+        if not targets:
+            die("queue-rm: no queue items matching '%s'" % rest[0])
+    rm_client = "false" if "--keep-files" in flags else "true"
+    blocklist = "true" if "--blocklist" in flags else "false"
+    go = "--yes" in flags
+    print("%squeue-rm %d item(s) (removeFromClient=%s, blocklist=%s):" % (
+        "" if go else "[dry-run] ", len(targets), rm_client, blocklist))
+    for t in targets:
+        print("  %-10s %s" % (t["id"], t["title"][:70]))
+    if not go:
+        print("  (pass --yes to remove)")
+        return
+    for t in targets:
+        api(svc, "DELETE", "/queue/%d?removeFromClient=%s&blocklist=%s" % (
+            t["id"], rm_client, blocklist))
+        print("  removed: %s" % t["title"][:70])
 
 
 def cmd_history(svc, args):
@@ -687,10 +804,13 @@ def cmd_import(svc, args):
     SAFETY: a folder may hold files from many shows. --match restricts to files
     whose name contains SUBSTR (case-insensitive). Without it, EVERY file under
     the folder is mapped onto this series — only safe for a single-show folder."""
+    if svc == "radarr":
+        return _cmd_import_radarr(args)
     if not svc.startswith("sonarr"):
-        die("import: sonarr only")
+        die("import: sonarr or radarr only")
     flags, rest = pop_flags(args, {"--series": 1, "--match": 1, "--season": 1,
-                                   "--map": 1, "--mode": 1, "--dry-run": 0})
+                                   "--map": 1, "--mode": 1, "--dry-run": 0,
+                                   "--wait": 0, "--timeout": 1})
     if not rest or "--series" not in flags:
         die("import: usage: arr sonarr import <folder> --series <id|query> "
             "[--match SUBSTR] [--season N] [--map auto|abs|se] [--mode copy|move] [--dry-run]")
@@ -735,6 +855,59 @@ def cmd_import(svc, args):
             {"name": "ManualImport", "importMode": impmode, "files": payload})
     print("ManualImport queued: id=%s status=%s (%d files)" % (
         r.get("id"), r.get("status"), len(payload)))
+    if "--wait" in flags:
+        rec = _wait_command(svc, r["id"], timeout=int(flags.get("--timeout", 300)))
+        print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
+
+
+def _cmd_import_radarr(args):
+    """Force-import downloaded file(s) into a movie, bypassing name matching.
+
+    arr radarr import <folder> --movie <id|query> [--match SUBSTR]
+        [--mode copy|move] [--dry-run] [--wait]"""
+    flags, rest = pop_flags(args, {"--movie": 1, "--match": 1, "--mode": 1,
+                                   "--dry-run": 0, "--wait": 0, "--timeout": 1})
+    if not rest or "--movie" not in flags:
+        die("import: usage: arr radarr import <folder> --movie <id|query> "
+            "[--match SUBSTR] [--mode copy|move] [--dry-run] [--wait]")
+    mid = resolve_id("radarr", flags["--movie"])
+    match = (flags.get("--match") or "").lower()
+    impmode = flags.get("--mode", "copy")
+    files = api("radarr", "GET",
+                "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(rest[0]),
+                timeout=SEARCH_TIMEOUT)
+    payload, skipped = [], []
+    for f in files or []:
+        name = (f.get("relativePath") or f.get("path") or "").split("/")[-1]
+        if match and match not in name.lower():
+            continue
+        if not f.get("quality"):
+            skipped.append(name)
+            continue
+        payload.append({
+            "path": f["path"], "movieId": mid, "quality": f["quality"],
+            "languages": f.get("languages") or [{"id": 1, "name": "English"}],
+            "releaseGroup": f.get("releaseGroup", ""),
+            "_label": name,
+        })
+    for p in payload:
+        print("  " + p.pop("_label"))
+    if skipped:
+        print("  (skipped %d without parsed quality: %s%s)" % (
+            len(skipped), ", ".join(skipped[:3]), " ..." if len(skipped) > 3 else ""))
+    if not payload:
+        print("nothing to import")
+        return
+    if "--dry-run" in flags:
+        print("DRY: would ManualImport %d file(s) [mode=%s]" % (len(payload), impmode))
+        return
+    r = api("radarr", "POST", "/command",
+            {"name": "ManualImport", "importMode": impmode, "files": payload})
+    print("ManualImport queued: id=%s status=%s (%d files)" % (
+        r.get("id"), r.get("status"), len(payload)))
+    if "--wait" in flags:
+        rec = _wait_command("radarr", r["id"], timeout=int(flags.get("--timeout", 300)))
+        print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
 
 
 # --- SABnzbd commands (arr sab <cmd>) ---------------------------------------
@@ -1122,7 +1295,9 @@ JELLYFIN_COMMANDS = {"unwatched": cmd_jf_unwatched}
 COMMANDS = {
     "status": cmd_status, "get": cmd_get, "seasons": cmd_seasons,
     "releases": cmd_releases, "grab": cmd_grab, "monitor": cmd_monitor,
-    "queue": cmd_queue, "stuck": cmd_stuck, "history": cmd_history, "wanted": cmd_wanted,
+    "queue": cmd_queue, "queue-rm": cmd_queue_rm, "stuck": cmd_stuck,
+    "episodes": cmd_episodes, "wait": cmd_wait,
+    "history": cmd_history, "wanted": cmd_wanted,
     "parse": cmd_parse, "search": cmd_search, "import": cmd_import,
     "files": cmd_files, "delete": cmd_delete,
     "availability": cmd_availability, "lookup": cmd_lookup, "info": cmd_info,
@@ -1141,10 +1316,14 @@ Commands (sonarr & radarr unless noted):
   get <id|query>                  full JSON for one item
   seasons <id|query>              (sonarr) per-season monitored + on-disk
   releases <id|query> [--season N|--episode EPID]
-  grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run]
+  grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run] [--wait]
         no flags: search & let the arr decide (respects quality profile)
         --override: force-push every candidate release (bypass rejections)
         --via-sab: send candidate NZBs straight to SAB (bypass search cache)
+        --wait: block until the triggered command finishes (--timeout SECS, def 300)
+  episodes <id|query> [--season N] [--missing] [--monitored] [--json]   (sonarr)
+        list episodes WITH ids (for grab/import by --episode). --missing = no file
+  wait <commandId> [--timeout SECS]   block until a search/grab/import/refresh ends
   monitor <id|query> <spec>       sonarr: all|none|s1,s2,...   radarr: on|off
   info <id|query>                 concise identity (title/year/ids/origTitle/altTitles/state)
   lookup <term>                   TMDB/TVDB metadata search (disambiguate 1990 vs 2003)
@@ -1155,11 +1334,15 @@ Commands (sonarr & radarr unless noted):
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
   parse "<release title>"         show how the arr maps a title (series+episode)
   import <folder> --series <id|query> [--match SUBSTR] [--season N]
-        [--map auto|abs|se] [--mode copy|move] [--dry-run]
+        [--map auto|abs|se] [--mode copy|move] [--dry-run] [--wait]   (sonarr)
         force-import files into episodes, bypassing name matching (maps by
         absolute/SxxExx number). --match filters filenames (USE IT in a shared
         download folder, or every file gets mapped onto this series).
+  import <folder> --movie <id|query> [--match SUBSTR] [--mode copy|move]
+        [--dry-run] [--wait]   (radarr) force-import file(s) into a movie
   queue [query]                    show download queue
+  queue-rm <id|pat> [--blocklist] [--keep-files] [--yes]   remove queue record(s)
+        via API (dry-run unless --yes); default also removes from download client
   stuck [query] [--json|--quiet]   queue items needing intervention (failed/import-blocked/pending)
   history [id|query] | wanted
   search <query> [--group X] [--indexer Y] [--limit N] [--json]   (prowlarr)
