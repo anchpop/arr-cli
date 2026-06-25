@@ -216,6 +216,52 @@ def pop_flags(args, spec):
     return vals, rest
 
 
+# --- requester tagging -------------------------------------------------------
+# The download-notifier daemon (declared in /etc/nixos/configuration.nix) DMs the
+# person who asked for a download, with a live progress bar. For requests that
+# come in through Seerr it resolves the requester itself. For "hey bot, grab me
+# X" asks made straight to Hermes, there's no Seerr row — so when Hermes grabs on
+# someone's behalf it stamps the series/movie with a `requester:<discordId>` tag
+# (their Discord user id) and the notifier reads that. Tag the DISCORD id, not a
+# Jellyfin username: it's exactly what's needed to DM, Hermes already has it, and
+# it works for people with no Jellyfin account.
+def _ensure_tag(svc, label):
+    for t in api(svc, "GET", "/tag") or []:
+        if (t.get("label") or "").lower() == label.lower():
+            return t["id"]
+    return api(svc, "POST", "/tag", {"label": label})["id"]
+
+
+def _tag_requester(svc, query, discord_id, remove=False):
+    if svc.startswith("sonarr"):
+        coll, ids_field = "series", "seriesIds"
+    elif svc == "radarr":
+        coll, ids_field = "movie", "movieIds"
+    else:
+        die("tag: only sonarr/sonarr-anime/radarr have taggable items")
+    did = str(discord_id).strip()
+    if not did.isdigit():
+        die("tag: --requester must be a numeric Discord user id (got %r)" % discord_id)
+    item_id = resolve_id(svc, query)
+    # Sonarr/Radarr tag labels allow only [a-z0-9-] (no colon), so `requester-<id>`.
+    tag_id = _ensure_tag(svc, "requester-" + did)
+    api(svc, "PUT", "/%s/editor" % coll,
+        {ids_field: [item_id], "tags": [tag_id],
+         "applyTags": "remove" if remove else "add"})
+    return coll, item_id, did
+
+
+def cmd_tag(svc, args):
+    """arr <svc> tag <id|query> --requester <discordId> [--remove]"""
+    flags, rest = pop_flags(args, {"--requester": 1, "--remove": 0})
+    if not rest or "--requester" not in flags:
+        die("tag: usage: arr <svc> tag <id|query> --requester <discordId> [--remove]")
+    coll, item_id, did = _tag_requester(svc, rest[0], flags["--requester"],
+                                        remove="--remove" in flags)
+    verb = "removed from" if "--remove" in flags else "added to"
+    print("requester:%s %s %s #%d" % (did, verb, coll, item_id))
+
+
 # --- commands ----------------------------------------------------------------
 def cmd_status(svc, args):
     q = (args[0].lower() if args else "")
@@ -369,10 +415,16 @@ def cmd_grab(svc, args):
         return cmd_prowlarr_grab(args)
     flags, rest = pop_flags(args, {"--season": 1, "--episode": 1,
                                    "--override": 0, "--via-sab": 0, "--dry-run": 0,
-                                   "--wait": 0, "--timeout": 1})
+                                   "--wait": 0, "--timeout": 1, "--requester": 1})
     if not rest:
         die("grab: need an id or query")
     override, dry = "--override" in flags, "--dry-run" in flags
+
+    # Stamp the requester so the download-notifier DMs them with a progress bar.
+    # Tagging the series/movie is branch-independent, so do it once up front.
+    if flags.get("--requester") and not dry and svc != "prowlarr":
+        _coll, _id, _did = _tag_requester(svc, rest[0], flags["--requester"])
+        print("tagged requester:%s on %s #%d" % (_did, _coll, _id))
 
     if "--via-sab" in flags:
         # Fetch candidate usenet releases and hand their NZBs straight to SAB
@@ -1301,7 +1353,7 @@ COMMANDS = {
     "parse": cmd_parse, "search": cmd_search, "import": cmd_import,
     "files": cmd_files, "delete": cmd_delete,
     "availability": cmd_availability, "lookup": cmd_lookup, "info": cmd_info,
-    "raw": cmd_raw,
+    "tag": cmd_tag, "raw": cmd_raw,
 }
 
 USAGE = """arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
@@ -1321,6 +1373,10 @@ Commands (sonarr & radarr unless noted):
         --override: force-push every candidate release (bypass rejections)
         --via-sab: send candidate NZBs straight to SAB (bypass search cache)
         --wait: block until the triggered command finishes (--timeout SECS, def 300)
+        --requester <discordId>: stamp a requester:<id> tag so the download-notifier
+              DMs that person a live progress bar (use when grabbing for someone)
+  tag <id|query> --requester <discordId> [--remove]   (sonarr/radarr)
+        add/remove the requester tag the download-notifier reads (see grab)
   episodes <id|query> [--season N] [--missing] [--monitored] [--json]   (sonarr)
         list episodes WITH ids (for grab/import by --episode). --missing = no file
   wait <commandId> [--timeout SECS]   block until a search/grab/import/refresh ends
