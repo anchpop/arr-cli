@@ -41,6 +41,10 @@ QBIT = {"port": 8080}
 JELLYFIN = {"port": 8096, "key": "JELLYFIN_API_KEY"}
 # Jellyseerr (request frontend) API, port 5055; auth via X-Api-Key.
 SEERR = {"port": 5055, "key": "SEERR_API_KEY"}
+# Bazarr (subtitle manager) API, port 6767; auth via X-API-KEY. NB Bazarr is
+# wired to the MAIN sonarr (:8989) + radarr only — sonarr-anime items are not
+# covered (Bazarr 1.x is single-instance-per-arr).
+BAZARR = {"port": 6767, "key": "BAZARR_API_KEY"}
 
 
 def die(msg):
@@ -73,9 +77,13 @@ def _load_env_file():
 def env_key(name, envvar):
     if os.environ.get(envvar):
         return os.environ[envvar]
+    # the hermes agent gets keys as plain env vars (SONARR_API_KEY=...) and
+    # cannot read the sops-rendered file — check the direct name too
+    if os.environ.get(name):
+        return os.environ[name]
     val = _load_env_file().get(name)
     if not val:
-        die("no key %s (looked at $%s and %s)" % (name, envvar, ENV_FILE))
+        die("no key %s (looked at $%s, $%s and %s)" % (name, envvar, name, ENV_FILE))
     return val
 
 
@@ -153,6 +161,28 @@ def jf_api(path, params=None, timeout=60, method="GET", soft=False):
             return None
         die("jellyfin %s -> %s" % (path, getattr(e, "reason", e)))
     return json.loads(raw) if raw.strip() else None
+
+
+def bazarr_api(method, path, params=None, timeout=120, soft=False):
+    qs = ("?" + urllib.parse.urlencode(params, doseq=True)) if params else ""
+    url = "http://localhost:%d/api%s%s" % (BAZARR["port"], path, qs)
+    req = urllib.request.Request(url, method=method)
+    req.add_header("X-API-KEY", env_key(BAZARR["key"], "ARR_API_KEY_BAZARR"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode()
+    except urllib.error.HTTPError as e:
+        if soft:
+            return None
+        die("bazarr %s %s -> HTTP %d %s" % (method, path, e.code, e.read().decode(errors="replace")[:200]))
+    except (TimeoutError, urllib.error.URLError) as e:
+        if soft:
+            return None
+        die("bazarr %s %s -> %s" % (method, path, getattr(e, "reason", e)))
+    try:
+        return json.loads(raw) if raw.strip() else None
+    except ValueError:
+        return raw
 
 
 def seerr_api(path, params=None, timeout=60, soft=False):
@@ -1246,19 +1276,58 @@ def _coverage_all(svc, flags):
             fixed, "; raise --limit to fix more per run" if fixed >= limit else ""))
 
 
-def cmd_coverage(svc, args):
-    """Per-season coverage vs AIRED episodes + gap repair.
+def _season_track_coverage(svc, sid, lang="eng"):
+    """ffprobe every on-disk file of a series; per-season audio/sub coverage
+    for <lang> (embedded streams + sidecar subs)."""
+    s = api(svc, "GET", "/series/%d" % sid)
+    seasons = {}
+    for f in api(svc, "GET", "/episodefile?seriesId=%d" % sid) or []:
+        path = f.get("path") or os.path.join(s.get("path", ""), f.get("relativePath", ""))
+        label = f.get("relativePath") or path
+        sn = f.get("seasonNumber", 0)
+        d = seasons.setdefault(sn, {"files": 0, "unreadable": 0,
+                                    "missing_audio": [], "missing_subs": []})
+        audio, subs, ok = _file_tracks(path)
+        if not ok:
+            d["unreadable"] += 1
+            continue
+        d["files"] += 1
+        if not any(t["lang"] == lang for t in audio):
+            d["missing_audio"].append(label)
+        if not any(t["lang"] == lang for t in subs):
+            d["missing_subs"].append(label)
+    return seasons
 
-    arr sonarr coverage <id|query> [--fix] [--dry-run]
+
+def _bazarr_search_series(svc, sid, title):
+    """Kick Bazarr's search-missing for a series (main sonarr only)."""
+    if svc != "sonarr":
+        print("  => '%s' lives on %s — Bazarr only watches the MAIN sonarr, so no"
+              " subtitle search was triggered (grab a subbed/dual release instead)" % (title, svc))
+        return
+    bazarr_api("PATCH", "/series", {"seriesid": sid, "action": "search-missing"})
+    print("  => Bazarr search-missing triggered for '%s' — subs download in the"
+          " background as providers allow; check `arr bazarr wanted '%s'` later" % (title, title))
+
+
+def cmd_coverage(svc, args):
+    """Per-season coverage vs AIRED episodes + gap repair (+ dub/sub coverage).
+
+    arr sonarr coverage <id|query> [--fix] [--tracks] [--lang LANG] [--fix-subs] [--dry-run]
     arr sonarr coverage --all [--fix] [--quiet] [--limit N]
     Policy: partial/missing MONITORED seasons are fixable (--fix searches them);
     unmonitored seasons are only reported — ask the requester before grabbing.
+    --tracks adds per-season audio/subtitle coverage for --lang (default eng),
+    via ffprobe — the "do all episodes have an English dub/subs?" view.
+    --fix-subs additionally triggers a Bazarr search for missing subs (main
+    sonarr + radarr only; the anime instance isn't Bazarr-covered).
     --all sweeps every monitored series (cron-friendly; --quiet = silent when
     clean; --fix caps at --limit series per run to be kind to indexers)."""
     if not svc.startswith("sonarr"):
         die("coverage: sonarr/sonarr-anime only")
     flags, rest = pop_flags(args, {"--fix": 0, "--all": 0, "--quiet": 0,
-                                   "--limit": 1, "--dry-run": 0})
+                                   "--limit": 1, "--dry-run": 0,
+                                   "--tracks": 0, "--lang": 1, "--fix-subs": 0})
     if "--all" in flags:
         return _coverage_all(svc, flags)
     if not rest:
@@ -1277,6 +1346,40 @@ def cmd_coverage(svc, args):
             _coverage_fix(svc, sid, fixable, dry="--dry-run" in flags)
         else:
             print("  => fixable gaps in monitored seasons: rerun with --fix to trigger searches")
+    if "--tracks" not in flags and "--fix-subs" not in flags:
+        return
+    lang = _norm_lang(flags.get("--lang", "eng"))
+    tc = _season_track_coverage(svc, sid, lang)
+    print("tracks (%s audio/subs; embedded + sidecar):" % lang)
+    audio_gaps = sub_gaps = False
+    for sn in sorted(tc):
+        d = tc[sn]
+        if not d["files"] and not d["unreadable"]:
+            continue
+        ma, ms = len(d["missing_audio"]), len(d["missing_subs"])
+        audio_gaps = audio_gaps or bool(ma)
+        sub_gaps = sub_gaps or bool(ms)
+        print("  S%-2d audio %d/%d   subs %d/%d%s" % (
+            sn, d["files"] - ma, d["files"], d["files"] - ms, d["files"],
+            ("   (%d unreadable)" % d["unreadable"]) if d["unreadable"] else ""))
+        for lbl in d["missing_audio"][:4]:
+            print("       no %s audio: %s" % (lang, lbl))
+        if ma > 4:
+            print("       ... +%d more without %s audio" % (ma - 4, lang))
+        for lbl in d["missing_subs"][:4]:
+            print("       no %s subs:  %s" % (lang, lbl))
+        if ms > 4:
+            print("       ... +%d more without %s subs" % (ms - 4, lang))
+    if sub_gaps:
+        if "--fix-subs" in flags:
+            _bazarr_search_series(svc, sid, s["title"])
+        elif svc == "sonarr":
+            print("  => missing subs: `--fix-subs` (or `arr bazarr search --series %d`) asks Bazarr to fetch them" % sid)
+        else:
+            print("  => missing subs: %s is NOT Bazarr-covered (anime instance) — prefer a subbed/dual release" % svc)
+    if audio_gaps:
+        print("  => missing %s audio can't be 'fetched' — needs a dub release:"
+              " `arr %s releases %d --season N --audio %s`" % (lang, svc, sid, lang))
 
 
 # --- add / replace ------------------------------------------------------------
@@ -1651,6 +1754,13 @@ def cmd_tracks(svc, args):
                            "subs:%s" % want_s if want_s else None) if x)
         print("%d/%d file(s) missing %s%s" % (
             flagged, len(rows), what, "; %d unreadable" % unreadable if unreadable else ""))
+        if flagged and want_s:
+            if svc == "sonarr":
+                print("  -> fetch subs via Bazarr: arr bazarr search --series %d" % iid)
+            elif svc == "radarr":
+                print("  -> fetch subs via Bazarr: arr bazarr search --movie %d" % iid)
+            else:
+                print("  -> %s is not Bazarr-covered (anime instance); prefer a subbed/dual release" % svc)
     else:
         print("(%d file(s)%s)" % (len(rows), "; %d unreadable" % unreadable if unreadable else ""))
 
@@ -2337,6 +2447,95 @@ def cmd_jf_refresh(args):
     sys.exit(2)
 
 
+# --- Bazarr (subtitle manager) -------------------------------------------------
+def bazarr_status(args):
+    """Bazarr health: provider throttle state + wanted-subtitle backlog."""
+    st = (bazarr_api("GET", "/system/status") or {}).get("data") or {}
+    print("bazarr %s (sonarr %s, radarr %s)" % (
+        st.get("bazarr_version"), st.get("sonarr_version"), st.get("radarr_version")))
+    for p in (bazarr_api("GET", "/providers") or {}).get("data") or []:
+        retry = p.get("retry")
+        print("  provider %-18s %s%s" % (
+            p.get("name"), p.get("status"),
+            ("  (retry %s)" % retry) if retry and retry != "-" else ""))
+    we = bazarr_api("GET", "/episodes/wanted", {"start": 0, "length": 1}) or {}
+    wm = bazarr_api("GET", "/movies/wanted", {"start": 0, "length": 1}) or {}
+    print("wanted: %s episode(s) + %s movie(s) missing subtitles" % (
+        we.get("total", "?"), wm.get("total", "?")))
+    print("(covers MAIN sonarr + radarr only — sonarr-anime items are not managed by Bazarr)")
+
+
+def bazarr_wanted(args):
+    """arr bazarr wanted [pattern] [--tv|--movies] [--limit N] — what Bazarr
+    still owes subtitles for (its own wanted list, main sonarr + radarr)."""
+    flags, rest = pop_flags(args, {"--tv": 0, "--movies": 0, "--limit": 1})
+    pat = rest[0].lower() if rest else None
+    lim = int(flags.get("--limit", "500"))
+    shown = 0
+    if "--movies" not in flags:
+        data = bazarr_api("GET", "/episodes/wanted", {"start": 0, "length": lim}) or {}
+        rows = data.get("data") or []
+        for r in rows:
+            title = r.get("seriesTitle") or ""
+            if pat and pat not in title.lower():
+                continue
+            langs = ",".join(x.get("code3", "?") for x in r.get("missing_subtitles") or [])
+            print("  tv     %-35s %-6s %-28s wants: %s" % (
+                title[:35], r.get("episode_number"), (r.get("episodeTitle") or "")[:28], langs))
+            shown += 1
+        if not pat:
+            print("  (tv total: %s)" % data.get("total"))
+    if "--tv" not in flags:
+        data = bazarr_api("GET", "/movies/wanted", {"start": 0, "length": lim}) or {}
+        for r in data.get("data") or []:
+            title = r.get("title") or ""
+            if pat and pat not in title.lower():
+                continue
+            langs = ",".join(x.get("code3", "?") for x in r.get("missing_subtitles") or [])
+            print("  movie  %-64s wants: %s" % (title[:64], langs))
+            shown += 1
+        if not pat:
+            print("  (movie total: %s)" % data.get("total"))
+    if pat and not shown:
+        print("nothing in Bazarr's wanted list matching '%s' (NB anime-instance items never appear here)" % rest[0])
+
+
+def bazarr_search(args):
+    """arr bazarr search --series <sonarr id|query> | --movie <radarr id|query>
+    Trigger Bazarr's search-missing for one item (uses the configured providers
+    + OpenSubtitles membership; downloads happen in the background)."""
+    flags, _ = pop_flags(args, {"--series": 1, "--movie": 1})
+    if flags.get("--series"):
+        sid = resolve_id("sonarr", flags["--series"])
+        s = api("sonarr", "GET", "/series/%d" % sid)
+        bazarr_api("PATCH", "/series", {"seriesid": sid, "action": "search-missing"})
+        print("Bazarr search-missing triggered for series '%s' (sonarr id %d)" % (s["title"], sid))
+    elif flags.get("--movie"):
+        mid = resolve_id("radarr", flags["--movie"])
+        m = api("radarr", "GET", "/movie/%d" % mid)
+        bazarr_api("PATCH", "/movies", {"radarrid": mid, "action": "search-missing"})
+        print("Bazarr search-missing triggered for movie '%s' (radarr id %d)" % (m["title"], mid))
+    else:
+        die("bazarr search: need --series <sonarr id|query> or --movie <radarr id|query>"
+            " (sonarr-anime items are not Bazarr-covered)")
+    print("(async — verify later with `arr bazarr wanted <title>` or `arr <svc> tracks <item> --missing-subs eng`)")
+
+
+def bazarr_raw(args):
+    if len(args) < 2:
+        die("bazarr raw: usage: arr bazarr raw <METHOD> <path> [urlencoded-params]")
+    method, path = args[0].upper(), args[1]
+    if not path.startswith("/"):
+        path = "/" + path
+    params = dict(urllib.parse.parse_qsl(args[2])) if len(args) > 2 else None
+    out = bazarr_api(method, path, params)
+    print(json.dumps(out, indent=2) if out is not None else "(empty response)")
+
+
+BAZARR_COMMANDS = {"status": bazarr_status, "wanted": bazarr_wanted,
+                   "search": bazarr_search, "raw": bazarr_raw}
+
+
 SEERR_COMMANDS = {"requests": seerr_requests, "request": seerr_request,
                   "unfulfilled": seerr_unfulfilled}
 
@@ -2362,7 +2561,7 @@ COMMANDS = {
 USAGE = """arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
 
   arr <service> <command> [args]
-  service: sonarr | sonarr-anime | radarr | prowlarr | sab | jellyfin | seerr
+  service: sonarr | sonarr-anime | radarr | prowlarr | sab | jellyfin | seerr | bazarr
   (sonarr-anime = the dedicated anime Sonarr on :8990; all sonarr commands work
    against it, e.g. `arr sonarr-anime status`, `arr sonarr-anime seasons <show>`)
 
@@ -2378,11 +2577,14 @@ Commands (sonarr & radarr unless noted):
         library, prints its per-season coverage instead of adding. Defaults:
         monitor all regular seasons, library-majority quality profile, search
         immediately. --requester wires up the download-notifier DM.
-  coverage <id|query> [--fix] [--dry-run]   (sonarr)
+  coverage <id|query> [--fix] [--tracks] [--lang LANG] [--fix-subs] [--dry-run]  (sonarr)
   coverage --all [--fix] [--quiet] [--limit N]
         per-season gaps vs AIRED episodes. --fix searches missing MONITORED
         eps (partial season -> EpisodeSearch, empty -> SeasonSearch);
         unmonitored seasons are only reported — ask the requester first.
+        --tracks adds per-season DUB/SUB coverage for --lang (default eng) via
+        ffprobe; --fix-subs also asks Bazarr to fetch missing subs (main sonarr
+        only — the anime instance isn't Bazarr-covered).
         --all sweeps every monitored series (cron this; --quiet = silent when clean)
   tracks <id|query> [--season N] [--missing-audio LANG] [--missing-subs LANG] [--json]
         audio/sub tracks per file via ffprobe + sidecar .srt detection.
@@ -2456,6 +2658,14 @@ Jellyfin / Seerr:
         (cross-checked against the arrs; flags Seerr-says-partial-but-complete
         divergences; --fix triggers arr-side searches for real gaps)
 
+Bazarr (subtitle manager — covers MAIN sonarr + radarr; NOT sonarr-anime):
+  arr bazarr status                     provider health/throttles + wanted backlog
+  arr bazarr wanted [pat] [--tv|--movies]   items Bazarr still owes subs for
+  arr bazarr search --series <q> | --movie <q>   trigger its subtitle search
+  arr bazarr raw <METHOD> <path> [urlencoded-params]
+  Prefer Bazarr for subtitles (it holds the OpenSubtitles membership) over
+  hand-rolled subliminal runs.
+
 Keys come from $ARR_API_KEY_<SVC> / $ARR_API_KEY_{SAB,JELLYFIN,SEERR} or the
 sops-rendered env file (%s). No sudo required.""" % ENV_FILE
 
@@ -2489,8 +2699,16 @@ def main(argv):
             die("unknown seerr command '%s'" % argv[1])
         fn(argv[2:])
         return
+    if svc == "bazarr":
+        if len(argv) < 2:
+            die("bazarr: status|wanted|search|raw")
+        fn = BAZARR_COMMANDS.get(argv[1])
+        if not fn:
+            die("unknown bazarr command '%s'" % argv[1])
+        fn(argv[2:])
+        return
     if svc not in SERVICES:
-        die("unknown service '%s' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr)" % svc)
+        die("unknown service '%s' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr)" % svc)
     if len(argv) < 2:
         print(USAGE)
         sys.exit(1)
@@ -2502,4 +2720,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    try:
+        import signal
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # no traceback when piped to head
+    except (ImportError, AttributeError, ValueError):
+        pass
     main(sys.argv[1:])
