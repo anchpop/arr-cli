@@ -13,6 +13,8 @@ Key source (first hit wins):
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -134,18 +136,23 @@ def sab_api(mode, params=None, timeout=120):
         return raw
 
 
-def jf_api(path, params=None, timeout=60):
+def jf_api(path, params=None, timeout=60, method="GET", soft=False):
     qs = ("?" + urllib.parse.urlencode(params)) if params else ""
     url = "http://localhost:%d%s%s" % (JELLYFIN["port"], path, qs)
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, method=method)
     req.add_header("X-Emby-Token", jf_key())
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode())
+            raw = resp.read().decode()
     except urllib.error.HTTPError as e:
+        if soft:
+            return None
         die("jellyfin %s -> HTTP %d" % (path, e.code))
     except (TimeoutError, urllib.error.URLError) as e:
+        if soft:
+            return None
         die("jellyfin %s -> %s" % (path, getattr(e, "reason", e)))
+    return json.loads(raw) if raw.strip() else None
 
 
 def seerr_api(path, params=None, timeout=60, soft=False):
@@ -263,18 +270,51 @@ def cmd_tag(svc, args):
 
 
 # --- commands ----------------------------------------------------------------
+def _season_gap_lines(svc, s):
+    """Cheap per-season gap flags from a series object's season statistics.
+    'aired' below = Sonarr's episodeCount stat (monitored episodes that aired)."""
+    out, gaps = [], False
+    for se in s.get("seasons", []):
+        sn = se["seasonNumber"]
+        st = se.get("statistics") or {}
+        have = st.get("episodeFileCount", 0)
+        aired = st.get("episodeCount", 0)
+        total = st.get("totalEpisodeCount", 0)
+        if sn == 0:
+            if total:
+                out.append("      S0 specials: %d/%d on disk%s" % (
+                    have, total, "" if se.get("monitored") else " (unmonitored)"))
+            continue
+        if se.get("monitored"):
+            if have < aired:
+                gaps = True
+                out.append("      ⚠ S%d: %d/%d aired eps on disk (%s)" % (
+                    sn, have, aired, "partial" if have else "missing"))
+        elif have < total:
+            gaps = True
+            out.append("      ○ S%d: not monitored, %d/%d on disk" % (sn, have, total))
+    if gaps:
+        out.append("      -> gaps: `arr %s coverage %d --fix` searches missing MONITORED"
+                   " eps; unmonitored seasons need the user's OK first" % (svc, s["id"]))
+    return out
+
+
 def cmd_status(svc, args):
     q = (args[0].lower() if args else "")
     if svc.startswith("sonarr"):
         items = sorted(api(svc, "GET", "/series"), key=lambda x: x["title"])
-        for s in items:
-            if q and q not in s["title"].lower():
-                continue
+        matches = [s for s in items if not q or q in s["title"].lower()]
+        for s in matches:
             st = s.get("statistics", {})
             print("[%d] %s (%s) — %s, mon=%s" % (s["id"], s["title"], s.get("year"), s["status"], s["monitored"]))
             print("      %d/%d eps on disk (%s%%), %sGB" % (
                 st.get("episodeFileCount", 0), st.get("totalEpisodeCount", 0),
                 st.get("percentOfEpisodes", 0), gb(st.get("sizeOnDisk"))))
+            # exactly one match -> surface per-season coverage right here, so a
+            # "do we have X?" check can't miss a partially-downloaded season
+            if len(matches) == 1:
+                for ln in _season_gap_lines(svc, s):
+                    print(ln)
     elif svc == "radarr":
         items = sorted(api(svc, "GET", "/movie"), key=lambda x: x["title"])
         for m in items:
@@ -324,7 +364,11 @@ SEARCH_TIMEOUT = 300  # interactive indexer searches (/release) can take minutes
 
 
 def cmd_releases(svc, args):
+    aflags, args = pop_flags(args, {"--audio": 1})
     rels = api(svc, "GET", "/release?" + _release_query(svc, args), timeout=SEARCH_TIMEOUT)
+    if aflags.get("--audio"):
+        want = _norm_lang(aflags["--audio"])
+        rels = [r for r in rels if _audio_match(r.get("title"), want)]
     rels.sort(key=lambda r: (r.get("rejected", False), -(r.get("seeders") or 0)))
     print("found %d release(s):" % len(rels))
     for r in rels:
@@ -575,8 +619,15 @@ def cmd_queue(svc, args):
 
 
 def cmd_stuck(svc, args):
-    """Show only queue items that need intervention: failed/import blocked/pending."""
-    flags, rest = pop_flags(args, {"--json": 0, "--quiet": 0})
+    """Show queue items that need intervention: failed/import blocked/pending.
+
+    arr <svc> stuck [query] [--json|--quiet] [--fix [--yes]]
+    --fix: for import-blocked/pending items, plan a force-import of the
+    completed download into its linked series/movie (the fix that previously
+    meant hand-crafting `arr import --match ...` every time). Shows the file->
+    episode mapping; applies it (mode=move) only with --yes. Failed items get a
+    suggested queue-rm+re-grab command instead."""
+    flags, rest = pop_flags(args, {"--json": 0, "--quiet": 0, "--fix": 0, "--yes": 0})
     pat = rest[0].lower() if rest else None
     q = _queue_records(svc, page_size=1000)
     rows = []
@@ -600,6 +651,91 @@ def cmd_stuck(svc, args):
         msgs = _queue_status_messages(r)
         if msgs:
             print("        " + "; ".join(msgs))
+    if "--fix" not in flags or not rows:
+        return
+    go = "--yes" in flags
+    print("\nfix plan%s:" % ("" if go else " [dry-run — pass --yes to apply]"))
+    cleared_dl = set()
+    for r in rows:
+        title = (r.get("title") or "")[:64]
+        state = r.get("trackedDownloadState")
+        if r.get("status") == "failed":
+            print("  failed: %s" % title)
+            print("    -> arr %s queue-rm %s --blocklist --yes   then re-grab" % (svc, r.get("id")))
+            continue
+        if state not in ("importBlocked", "importPending"):
+            print("  %s: %s — no automated fix, inspect manually" % (state, title))
+            continue
+        # already satisfied? (episode/movie has a file — e.g. we just imported a
+        # sibling record of the same season pack, or a better release landed)
+        # NB the episode/movie objects EMBEDDED in queue records are stale
+        # snapshots — query live state.
+        satisfied = False
+        if svc.startswith("sonarr") and r.get("episodeId"):
+            satisfied = bool((api(svc, "GET", "/episode/%d" % r["episodeId"]) or {}).get("hasFile"))
+        elif svc == "radarr" and ((r.get("movie") or {}).get("id") or r.get("movieId")):
+            _mid = (r.get("movie") or {}).get("id") or r.get("movieId")
+            satisfied = bool((api(svc, "GET", "/movie/%d" % _mid) or {}).get("hasFile"))
+        if satisfied:
+            if go:
+                rm_client = "false" if r.get("downloadId") in cleared_dl else "true"
+                cleared_dl.add(r.get("downloadId"))
+                api(svc, "DELETE", "/queue/%d?removeFromClient=%s&blocklist=false" % (r["id"], rm_client))
+                print("  satisfied: %s — already on disk; cleared stale queue record" % title)
+            else:
+                print("  satisfied: %s — already on disk; would clear stale queue record" % title)
+            continue
+        out = r.get("outputPath")
+        if not out:
+            print("  %s: %s — queue record has no outputPath; cannot map" % (state, title))
+            continue
+        if svc.startswith("sonarr"):
+            sid = r.get("seriesId") or (r.get("series") or {}).get("id")
+            if not sid:
+                print("  %s: %s — not linked to a series; try `arr %s import '%s' --series <query>`"
+                      % (state, title, svc, out))
+                continue
+            item = api(svc, "GET", "/series/%d" % sid)
+            payload, skipped = _plan_series_import(svc, out, sid)
+        else:
+            mid = (r.get("movie") or {}).get("id") or r.get("movieId")
+            if not mid:
+                print("  %s: %s — not linked to a movie; try `arr radarr import '%s' --movie <query>`"
+                      % (state, title, out))
+                continue
+            item = api(svc, "GET", "/movie/%d" % mid)
+            payload, skipped = _plan_movie_import(out, mid)
+        if not payload:
+            gone = False
+            try:
+                os.stat(out)
+            except FileNotFoundError:
+                gone = True
+            except OSError:
+                pass  # permission-restricted view — can't tell, stay neutral
+            if gone:
+                print("  %s: %s — download folder is GONE (stale queue record)" % (state, title))
+                print("    -> arr %s queue-rm %s --yes" % (svc, r.get("id")))
+            elif skipped and all(s.endswith("(not a video file)") for s in skipped):
+                print("  %s: %s — only non-video files (junk/malware release)" % (state, title))
+                print("    -> arr %s queue-rm %s --blocklist --yes   then re-grab" % (svc, r.get("id")))
+            else:
+                print("  %s: %s — no mappable files in %s (%d skipped)" % (state, title, out, len(skipped)))
+            continue
+        print("  %s -> %s: %d file(s):" % (title, item.get("title"), len(payload)))
+        for p in payload:
+            print("    " + p["_label"])
+        if skipped:
+            print("    (skipped %d unmatched)" % len(skipped))
+        if go:
+            # the target dir sometimes doesn't exist yet and the import API
+            # throws DirectoryNotFound — pre-create it if we're allowed to
+            try:
+                if item.get("path"):
+                    os.makedirs(item["path"], exist_ok=True)
+            except OSError:
+                pass
+            _run_manual_import(svc, payload, "move", wait=True)
 
 
 def _wait_command(svc, cmd_id, timeout=300, interval=3):
@@ -773,7 +909,8 @@ def cmd_search(svc, args):
     """Cross-indexer Prowlarr search with dedup + group/indexer filters."""
     if svc != "prowlarr":
         die("search: prowlarr only (sonarr/radarr use status/releases)")
-    flags, rest = pop_flags(args, {"--group": 1, "--indexer": 1, "--limit": 1, "--json": 0})
+    flags, rest = pop_flags(args, {"--group": 1, "--indexer": 1, "--limit": 1,
+                                   "--json": 0, "--audio": 1})
     if not rest:
         die("search: need a query")
     qs = urllib.parse.urlencode({"query": rest[0], "type": "search",
@@ -792,6 +929,11 @@ def cmd_search(svc, args):
     if flags.get("--indexer"):
         ix = flags["--indexer"].lower()
         rows = [r for r in rows if ix in (r.get("indexer", "").lower())]
+    if flags.get("--audio"):
+        # title-token heuristic (Dual Audio / English Dub / Multi ...) — the
+        # dub-hunting filter; releases don't carry real audio metadata
+        want = _norm_lang(flags["--audio"])
+        rows = [r for r in rows if _audio_match(r.get("title"), want)]
     if "--json" in flags:
         print(json.dumps(rows, indent=2))
         return
@@ -846,33 +988,16 @@ def _choose_ep(name, mode, season, by_se, by_abs):
     return None
 
 
-def cmd_import(svc, args):
-    """Force-import downloaded files into explicit episodes, bypassing name match.
+VIDEO_EXT = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".webm", ".wmv", ".mpg", ".mpeg")
 
-    arr sonarr import <folder> --series <id|query> [--match SUBSTR] [--season N]
-        [--map auto|abs|se] [--mode copy|move] [--dry-run]
-    Maps each file to an episode by parsing its number (absolute or SxxExx).
 
-    SAFETY: a folder may hold files from many shows. --match restricts to files
-    whose name contains SUBSTR (case-insensitive). Without it, EVERY file under
-    the folder is mapped onto this series — only safe for a single-show folder."""
-    if svc == "radarr":
-        return _cmd_import_radarr(args)
-    if not svc.startswith("sonarr"):
-        die("import: sonarr or radarr only")
-    flags, rest = pop_flags(args, {"--series": 1, "--match": 1, "--season": 1,
-                                   "--map": 1, "--mode": 1, "--dry-run": 0,
-                                   "--wait": 0, "--timeout": 1})
-    if not rest or "--series" not in flags:
-        die("import: usage: arr sonarr import <folder> --series <id|query> "
-            "[--match SUBSTR] [--season N] [--map auto|abs|se] [--mode copy|move] [--dry-run]")
-    sid = resolve_id(svc, flags["--series"])
-    match = (flags.get("--match") or "").lower()
-    mapmode = flags.get("--map", "auto")
-    season = int(flags["--season"]) if "--season" in flags else None
-    impmode = flags.get("--mode", "copy")
+def _plan_series_import(svc, folder, sid, match="", mapmode="auto", season=None):
+    """Map importable files in <folder> onto a series' episodes. Returns
+    (payload, skipped) — payload rows carry a human '_label' key.
+    Non-video files (.exe/.scr malware droppers in fake releases) are never
+    mapped, even if the arr's manualimport endpoint lists them."""
     files = api(svc, "GET",
-                "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(rest[0]),
+                "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(folder),
                 timeout=SEARCH_TIMEOUT)
     eps = api(svc, "GET", "/episode?seriesId=%d" % sid)
     by_se = {(e["seasonNumber"], e["episodeNumber"]): e for e in eps}
@@ -881,6 +1006,9 @@ def cmd_import(svc, args):
     for f in files or []:
         name = (f.get("relativePath") or f.get("path") or "").split("/")[-1]
         if match and match not in name.lower():
+            continue
+        if not name.lower().endswith(VIDEO_EXT):
+            skipped.append(name + " (not a video file)")
             continue
         ep = _choose_ep(name, mapmode, season, by_se, by_abs)
         if not ep or not f.get("quality"):
@@ -892,46 +1020,20 @@ def cmd_import(svc, args):
             "releaseGroup": f.get("releaseGroup", ""),
             "_label": "%s  ->  S%dE%d" % (name, ep["seasonNumber"], ep["episodeNumber"]),
         })
-    for p in payload:
-        print("  " + p.pop("_label"))
-    if skipped:
-        print("  (skipped %d unmatched: %s%s)" % (
-            len(skipped), ", ".join(skipped[:3]), " ..." if len(skipped) > 3 else ""))
-    if not payload:
-        print("nothing to import")
-        return
-    if "--dry-run" in flags:
-        print("DRY: would ManualImport %d file(s) [mode=%s]" % (len(payload), impmode))
-        return
-    r = api(svc, "POST", "/command",
-            {"name": "ManualImport", "importMode": impmode, "files": payload})
-    print("ManualImport queued: id=%s status=%s (%d files)" % (
-        r.get("id"), r.get("status"), len(payload)))
-    if "--wait" in flags:
-        rec = _wait_command(svc, r["id"], timeout=int(flags.get("--timeout", 300)))
-        print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
+    return payload, skipped
 
 
-def _cmd_import_radarr(args):
-    """Force-import downloaded file(s) into a movie, bypassing name matching.
-
-    arr radarr import <folder> --movie <id|query> [--match SUBSTR]
-        [--mode copy|move] [--dry-run] [--wait]"""
-    flags, rest = pop_flags(args, {"--movie": 1, "--match": 1, "--mode": 1,
-                                   "--dry-run": 0, "--wait": 0, "--timeout": 1})
-    if not rest or "--movie" not in flags:
-        die("import: usage: arr radarr import <folder> --movie <id|query> "
-            "[--match SUBSTR] [--mode copy|move] [--dry-run] [--wait]")
-    mid = resolve_id("radarr", flags["--movie"])
-    match = (flags.get("--match") or "").lower()
-    impmode = flags.get("--mode", "copy")
+def _plan_movie_import(folder, mid, match=""):
     files = api("radarr", "GET",
-                "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(rest[0]),
+                "/manualimport?folder=%s&filterExistingFiles=false" % urllib.parse.quote(folder),
                 timeout=SEARCH_TIMEOUT)
     payload, skipped = [], []
     for f in files or []:
         name = (f.get("relativePath") or f.get("path") or "").split("/")[-1]
         if match and match not in name.lower():
+            continue
+        if not name.lower().endswith(VIDEO_EXT):
+            skipped.append(name + " (not a video file)")
             continue
         if not f.get("quality"):
             skipped.append(name)
@@ -942,8 +1044,84 @@ def _cmd_import_radarr(args):
             "releaseGroup": f.get("releaseGroup", ""),
             "_label": name,
         })
+    return payload, skipped
+
+
+def _run_manual_import(svc, payload, impmode, batch=10, wait=False, timeout=300):
+    """POST ManualImport in chunks of <=batch files. Big single imports were
+    timing out (9+ episode batches hit the 120-300s wall); chunking + a wait
+    between chunks keeps each command small and reports per-chunk results."""
+    clean = [{k: v for k, v in p.items() if k != "_label"} for p in payload]
+    chunks = [clean[i:i + batch] for i in range(0, len(clean), batch)] if batch > 0 else [clean]
+    for i, chunk in enumerate(chunks):
+        r = api(svc, "POST", "/command",
+                {"name": "ManualImport", "importMode": impmode, "files": chunk})
+        n = "%d/%d " % (i + 1, len(chunks)) if len(chunks) > 1 else ""
+        print("ManualImport %squeued: id=%s status=%s (%d files)" % (
+            n, r.get("id"), r.get("status"), len(chunk)))
+        if wait or len(chunks) > 1:
+            rec = _wait_command(svc, r["id"], timeout=timeout)
+            print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
+
+
+def cmd_import(svc, args):
+    """Force-import downloaded files into explicit episodes, bypassing name match.
+
+    arr sonarr import <folder> --series <id|query> [--match SUBSTR] [--season N]
+        [--map auto|abs|se] [--mode copy|move] [--batch N] [--dry-run]
+    Maps each file to an episode by parsing its number (absolute or SxxExx).
+    Imports are chunked --batch files at a time (default 10) to dodge timeouts.
+
+    SAFETY: a folder may hold files from many shows. --match restricts to files
+    whose name contains SUBSTR (case-insensitive). Without it, EVERY file under
+    the folder is mapped onto this series — only safe for a single-show folder."""
+    if svc == "radarr":
+        return _cmd_import_radarr(args)
+    if not svc.startswith("sonarr"):
+        die("import: sonarr or radarr only")
+    flags, rest = pop_flags(args, {"--series": 1, "--match": 1, "--season": 1,
+                                   "--map": 1, "--mode": 1, "--dry-run": 0,
+                                   "--wait": 0, "--timeout": 1, "--batch": 1})
+    if not rest or "--series" not in flags:
+        die("import: usage: arr sonarr import <folder> --series <id|query> "
+            "[--match SUBSTR] [--season N] [--map auto|abs|se] [--mode copy|move] [--dry-run]")
+    sid = resolve_id(svc, flags["--series"])
+    season = int(flags["--season"]) if "--season" in flags else None
+    impmode = flags.get("--mode", "copy")
+    payload, skipped = _plan_series_import(
+        svc, rest[0], sid, match=(flags.get("--match") or "").lower(),
+        mapmode=flags.get("--map", "auto"), season=season)
     for p in payload:
-        print("  " + p.pop("_label"))
+        print("  " + p["_label"])
+    if skipped:
+        print("  (skipped %d unmatched: %s%s)" % (
+            len(skipped), ", ".join(skipped[:3]), " ..." if len(skipped) > 3 else ""))
+    if not payload:
+        print("nothing to import")
+        return
+    if "--dry-run" in flags:
+        print("DRY: would ManualImport %d file(s) [mode=%s]" % (len(payload), impmode))
+        return
+    _run_manual_import(svc, payload, impmode, batch=int(flags.get("--batch", 10)),
+                       wait="--wait" in flags, timeout=int(flags.get("--timeout", 300)))
+
+
+def _cmd_import_radarr(args):
+    """Force-import downloaded file(s) into a movie, bypassing name matching.
+
+    arr radarr import <folder> --movie <id|query> [--match SUBSTR]
+        [--mode copy|move] [--dry-run] [--wait]"""
+    flags, rest = pop_flags(args, {"--movie": 1, "--match": 1, "--mode": 1,
+                                   "--dry-run": 0, "--wait": 0, "--timeout": 1, "--batch": 1})
+    if not rest or "--movie" not in flags:
+        die("import: usage: arr radarr import <folder> --movie <id|query> "
+            "[--match SUBSTR] [--mode copy|move] [--dry-run] [--wait]")
+    mid = resolve_id("radarr", flags["--movie"])
+    impmode = flags.get("--mode", "copy")
+    payload, skipped = _plan_movie_import(rest[0], mid,
+                                          match=(flags.get("--match") or "").lower())
+    for p in payload:
+        print("  " + p["_label"])
     if skipped:
         print("  (skipped %d without parsed quality: %s%s)" % (
             len(skipped), ", ".join(skipped[:3]), " ..." if len(skipped) > 3 else ""))
@@ -953,16 +1131,690 @@ def _cmd_import_radarr(args):
     if "--dry-run" in flags:
         print("DRY: would ManualImport %d file(s) [mode=%s]" % (len(payload), impmode))
         return
-    r = api("radarr", "POST", "/command",
-            {"name": "ManualImport", "importMode": impmode, "files": payload})
-    print("ManualImport queued: id=%s status=%s (%d files)" % (
-        r.get("id"), r.get("status"), len(payload)))
-    if "--wait" in flags:
-        rec = _wait_command("radarr", r["id"], timeout=int(flags.get("--timeout", 300)))
-        print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
+    _run_manual_import("radarr", payload, impmode, batch=int(flags.get("--batch", 10)),
+                       wait="--wait" in flags, timeout=int(flags.get("--timeout", 300)))
 
 
-# --- SABnzbd commands (arr sab <cmd>) ---------------------------------------
+# --- coverage (the requested-show policy as a command) -----------------------
+def _series_coverage(svc, sid, series=None):
+    """Exact per-season coverage from the episode list (aired = airdate past).
+    Returns (series, rows); each row: {season, monitored, aired, files, future,
+    missing:[monitored aired eps w/o file], unmon_missing: count}."""
+    s = series or api(svc, "GET", "/series/%d" % sid)
+    eps = api(svc, "GET", "/episode?seriesId=%d" % sid)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    seasons = {}
+    for e in eps:
+        sn = e.get("seasonNumber", 0)
+        d = seasons.setdefault(sn, {"season": sn, "aired": 0, "files": 0,
+                                    "future": 0, "missing": [], "unmon_missing": 0})
+        aired = bool(e.get("airDateUtc")) and e["airDateUtc"][:19] <= now
+        if e.get("hasFile"):
+            d["files"] += 1
+        if aired:
+            d["aired"] += 1
+            if not e.get("hasFile"):
+                if e.get("monitored"):
+                    d["missing"].append(e)
+                else:
+                    d["unmon_missing"] += 1
+        elif not e.get("hasFile"):
+            d["future"] += 1
+    mon = {se["seasonNumber"]: bool(se.get("monitored")) for se in (s.get("seasons") or [])}
+    rows = []
+    for sn in sorted(seasons):
+        d = seasons[sn]
+        d["monitored"] = mon.get(sn, False)
+        rows.append(d)
+    return s, rows
+
+
+def _coverage_print(rows):
+    """Print per-season lines; return (fixable, askable) season rows."""
+    fixable, askable = [], []
+    for d in rows:
+        sn = d["season"]
+        if sn == 0:
+            if d["aired"] or d["files"]:
+                print("  S0   specials: %d/%d aired on disk%s" % (
+                    d["files"], d["aired"], "" if d["monitored"] else " (unmonitored)"))
+            continue
+        miss = len(d["missing"])
+        if d["monitored"] and miss:
+            state = ("⚠ PARTIAL — %d aired ep(s) missing" % miss) if d["files"] else "⚠ MISSING (0 on disk)"
+            fixable.append(d)
+        elif not d["monitored"] and d["files"] < d["aired"]:
+            state = "unmonitored, not fetched"
+            askable.append(d)
+        else:
+            state = "complete"
+        extra = " (+%d unaired)" % d["future"] if d["future"] else ""
+        print("  S%-2d %s %d/%d aired on disk%s — %s" % (
+            sn, "mon" if d["monitored"] else "off", d["files"], d["aired"], extra, state))
+    return fixable, askable
+
+
+def _coverage_fix(svc, sid, fixable, dry=False):
+    """Trigger searches for the gaps: whole-season -> SeasonSearch, partial ->
+    one EpisodeSearch with the missing episode ids."""
+    for d in fixable:
+        if d["files"] == 0:
+            body = {"name": "SeasonSearch", "seriesId": sid, "seasonNumber": d["season"]}
+            desc = "SeasonSearch S%d" % d["season"]
+        else:
+            ids = [e["id"] for e in d["missing"]]
+            body = {"name": "EpisodeSearch", "episodeIds": ids}
+            desc = "EpisodeSearch S%d (%d eps)" % (d["season"], len(ids))
+        if dry:
+            print("  DRY: " + desc)
+            continue
+        r = api(svc, "POST", "/command", body)
+        print("  queued %s (command id %s)" % (desc, r["id"]))
+
+
+def _coverage_all(svc, flags):
+    fix = "--fix" in flags
+    limit = int(flags.get("--limit", "10"))
+    gaps = []
+    for s in api(svc, "GET", "/series"):
+        if not s.get("monitored"):
+            continue
+        st = s.get("statistics") or {}
+        if st.get("episodeFileCount", 0) < st.get("episodeCount", 0):
+            gaps.append(s)
+    if not gaps:
+        if "--quiet" not in flags:
+            print("coverage: every monitored %s series has its monitored aired episodes on disk" % svc)
+        return
+    print("coverage: %d monitored series with gaps:" % len(gaps))
+    fixed = 0
+    for s in sorted(gaps, key=lambda x: x["title"]):
+        _, rows = _series_coverage(svc, s["id"], series=s)
+        fixable = [d for d in rows if d["season"] != 0 and d["monitored"] and d["missing"]]
+        if not fixable:
+            continue
+        print("  [%d] %s — %s" % (s["id"], s["title"], ", ".join(
+            "S%d %d/%d" % (d["season"], d["files"], d["aired"]) for d in fixable)))
+        if fix:
+            if fixed < limit:
+                _coverage_fix(svc, s["id"], fixable, dry="--dry-run" in flags)
+                fixed += 1
+            else:
+                print("    (fix skipped — --limit %d reached this run)" % limit)
+    if fix:
+        print("(searches triggered for %d series%s)" % (
+            fixed, "; raise --limit to fix more per run" if fixed >= limit else ""))
+
+
+def cmd_coverage(svc, args):
+    """Per-season coverage vs AIRED episodes + gap repair.
+
+    arr sonarr coverage <id|query> [--fix] [--dry-run]
+    arr sonarr coverage --all [--fix] [--quiet] [--limit N]
+    Policy: partial/missing MONITORED seasons are fixable (--fix searches them);
+    unmonitored seasons are only reported — ask the requester before grabbing.
+    --all sweeps every monitored series (cron-friendly; --quiet = silent when
+    clean; --fix caps at --limit series per run to be kind to indexers)."""
+    if not svc.startswith("sonarr"):
+        die("coverage: sonarr/sonarr-anime only")
+    flags, rest = pop_flags(args, {"--fix": 0, "--all": 0, "--quiet": 0,
+                                   "--limit": 1, "--dry-run": 0})
+    if "--all" in flags:
+        return _coverage_all(svc, flags)
+    if not rest:
+        die("coverage: need <id|query> or --all")
+    sid = resolve_id(svc, rest[0])
+    s, rows = _series_coverage(svc, sid)
+    print("%s (%s)" % (s["title"], s.get("year")))
+    fixable, askable = _coverage_print(rows)
+    if not fixable and not askable:
+        print("  => complete: all monitored aired episodes on disk")
+    if askable:
+        print("  => unmonitored gaps: ask before grabbing; enable with `arr %s monitor %d s%s`" % (
+            svc, sid, ",s".join(str(d["season"]) for d in askable)))
+    if fixable:
+        if "--fix" in flags:
+            _coverage_fix(svc, sid, fixable, dry="--dry-run" in flags)
+        else:
+            print("  => fixable gaps in monitored seasons: rerun with --fix to trigger searches")
+
+
+# --- add / replace ------------------------------------------------------------
+def _lookup_pick(svc, term, tvdb=None, tmdb=None, year=None):
+    """Lookup <term> and insist on ONE unambiguous winner. Multiple plausible
+    matches -> list candidates and refuse (the wrong-Gloria/wrong-Groove guard)."""
+    coll = "series" if svc.startswith("sonarr") else "movie"
+    res = api(svc, "GET", "/%s/lookup?term=%s" % (coll, urllib.parse.quote(term))) or []
+    cands = res
+    if tvdb:
+        cands = [c for c in cands if c.get("tvdbId") == tvdb]
+    if tmdb:
+        cands = [c for c in cands if c.get("tmdbId") == tmdb]
+    if year:
+        cands = [c for c in cands if c.get("year") == year]
+    if not cands:
+        die('no lookup results for "%s"%s' % (
+            term, " with those filters" if (tvdb or tmdb or year) else ""))
+    if len(cands) == 1:
+        return cands[0]
+    tl = term.lower()
+    exact = [c for c in cands
+             if (c.get("title") or "").lower() == tl or (c.get("originalTitle") or "").lower() == tl]
+    if len(exact) == 1:
+        return exact[0]
+    print('"%s" is ambiguous — candidates (narrow with --year / --%s):' % (
+        term, "tvdb" if coll == "series" else "tmdb"), file=sys.stderr)
+    for c in cands[:8]:
+        idlab = ("tvdb=%s" % c.get("tvdbId")) if coll == "series" else ("tmdb=%s" % c.get("tmdbId"))
+        orig = ""
+        if c.get("originalTitle") and c["originalTitle"] != c.get("title"):
+            orig = "  orig=%s" % c["originalTitle"]
+        print("  %s (%s)  %s%s" % (c.get("title"), c.get("year"), idlab, orig), file=sys.stderr)
+    die("refusing to guess between %d matches" % len(cands))
+
+
+def _existing_by_ids(svc, tvdb=None, tmdb=None, title=None):
+    coll = "series" if svc.startswith("sonarr") else "movie"
+    items = api(svc, "GET", "/" + coll) or []
+    for it in items:
+        if tvdb and it.get("tvdbId") == tvdb:
+            return it
+        if tmdb and it.get("tmdbId") == tmdb:
+            return it
+    if title:
+        tl = title.lower()
+        exact = [it for it in items if (it.get("title") or "").lower() == tl]
+        if len(exact) == 1:
+            return exact[0]
+    return None
+
+
+def _profile_and_root(svc, quality=None, root=None):
+    """Default to the quality profile most of the existing library uses."""
+    coll = "series" if svc.startswith("sonarr") else "movie"
+    profiles = api(svc, "GET", "/qualityprofile") or []
+    if not profiles:
+        die("add: no quality profiles configured")
+    if quality:
+        hits = [p for p in profiles if quality.lower() in p["name"].lower()]
+        if len(hits) != 1:
+            die("--quality '%s' matches %d profiles (have: %s)" % (
+                quality, len(hits), ", ".join(p["name"] for p in profiles)))
+        pid = hits[0]["id"]
+    else:
+        counts = {}
+        for it in api(svc, "GET", "/" + coll) or []:
+            counts[it.get("qualityProfileId")] = counts.get(it.get("qualityProfileId"), 0) + 1
+        valid = {p["id"] for p in profiles}
+        counts = {k: v for k, v in counts.items() if k in valid}
+        pid = max(counts, key=counts.get) if counts else profiles[0]["id"]
+    pname = next(p["name"] for p in profiles if p["id"] == pid)
+    roots = api(svc, "GET", "/rootfolder") or []
+    rpath = root or (roots[0]["path"] if roots else None)
+    if not rpath:
+        die("add: no root folder configured")
+    return pid, pname, rpath
+
+
+def _do_add(svc, pick, seasons_spec="all", quality=None, root=None, search=True):
+    """POST the new series/movie; returns the created item."""
+    is_series = svc.startswith("sonarr")
+    pid, pname, rpath = _profile_and_root(svc, quality, root)
+    body = {
+        "title": pick["title"], "qualityProfileId": pid,
+        "titleSlug": pick.get("titleSlug"), "images": pick.get("images") or [],
+        "year": pick.get("year"), "rootFolderPath": rpath, "monitored": True,
+    }
+    if is_series:
+        body["tvdbId"] = pick["tvdbId"]
+        body["seasonFolder"] = True
+        body["seriesType"] = "anime" if svc == "sonarr-anime" else (pick.get("seriesType") or "standard")
+        seasons = pick.get("seasons") or []
+        if seasons_spec == "all":
+            for se in seasons:
+                se["monitored"] = se["seasonNumber"] > 0
+        elif seasons_spec == "none":
+            for se in seasons:
+                se["monitored"] = False
+        else:
+            want = _parse_seasons(re.sub(r"[sS]", "", seasons_spec))
+            for se in seasons:
+                se["monitored"] = se["seasonNumber"] in want
+        body["seasons"] = seasons
+        body["addOptions"] = {"searchForMissingEpisodes": bool(search)}
+    else:
+        body["tmdbId"] = pick["tmdbId"]
+        body["minimumAvailability"] = "released"
+        body["addOptions"] = {"searchForMovie": bool(search)}
+    created = api(svc, "POST", "/series" if is_series else "/movie", body)
+    print("added [%d] %s (%s) — profile=%s root=%s" % (
+        created["id"], created["title"], created.get("year"), pname, rpath))
+    if is_series:
+        mon = [str(se["seasonNumber"]) for se in created.get("seasons", []) if se.get("monitored")]
+        print("  monitored seasons: %s" % (",".join("S" + n for n in mon) or "none"))
+    print("  search: %s" % ("triggered (the arr picks per its quality profile)" if search
+                            else "skipped (--no-search)"))
+    return created
+
+
+def cmd_add(svc, args):
+    """Add a series/movie by title — strict disambiguation, sane defaults.
+
+    arr sonarr add <title> [--tvdb ID] [--year Y] [--seasons all|s1,s2|none]
+    arr radarr  add <title> [--tmdb ID] [--year Y]
+    common: [--quality NAME] [--root PATH] [--no-search]
+            [--requester <discordId>] [--dry-run]
+
+    Refuses ambiguous lookups (lists candidates; narrow with --year/--tvdb/
+    --tmdb). If the item is ALREADY in the library it prints per-season
+    coverage instead of adding — so "get X" requests surface partially-
+    downloaded seasons automatically. --requester stamps the tag the
+    download-notifier uses to DM that person a progress bar."""
+    if not (svc.startswith("sonarr") or svc == "radarr"):
+        die("add: sonarr/sonarr-anime/radarr only")
+    flags, rest = pop_flags(args, {"--tvdb": 1, "--tmdb": 1, "--year": 1,
+                                   "--seasons": 1, "--quality": 1, "--root": 1,
+                                   "--no-search": 0, "--requester": 1, "--dry-run": 0})
+    if not rest:
+        die("add: need a title")
+    term = " ".join(rest)
+    is_series = svc.startswith("sonarr")
+    pick = _lookup_pick(svc,
+                        term,
+                        tvdb=int(flags["--tvdb"]) if flags.get("--tvdb") else None,
+                        tmdb=int(flags["--tmdb"]) if flags.get("--tmdb") else None,
+                        year=int(flags["--year"]) if flags.get("--year") else None)
+    existing = _existing_by_ids(svc,
+                                tvdb=pick.get("tvdbId") if is_series else None,
+                                tmdb=pick.get("tmdbId") if not is_series else None,
+                                title=pick.get("title"))
+    if existing:
+        print("already in %s: [%d] %s (%s)" % (svc, existing["id"], existing["title"], existing.get("year")))
+        if flags.get("--requester"):
+            _tag_requester(svc, str(existing["id"]), flags["--requester"])
+            print("  tagged requester:%s" % flags["--requester"])
+        if is_series:
+            _, rows = _series_coverage(svc, existing["id"])
+            fixable, askable = _coverage_print(rows)
+            if fixable:
+                print("  => partial monitored season(s): `arr %s coverage %d --fix` to repair"
+                      % (svc, existing["id"]))
+            if askable:
+                print("  => whole season(s) unmonitored: ask the requester, then "
+                      "`arr %s monitor %d s...` + `coverage --fix`" % (svc, existing["id"]))
+            if not fixable and not askable:
+                print("  => complete: all monitored aired episodes on disk")
+        else:
+            print("  " + ("ON DISK (%sGB)" % gb(existing.get("sizeOnDisk"))
+                          if existing.get("hasFile") else
+                          "no file yet — `arr radarr grab %d` re-searches" % existing["id"]))
+        return
+    # a series might live in the OTHER sonarr instance (anime vs normal)
+    if is_series and pick.get("tvdbId"):
+        other = "sonarr-anime" if svc == "sonarr" else "sonarr"
+        try:
+            twin = _existing_by_ids(other, tvdb=pick["tvdbId"])
+        except SystemExit:
+            twin = None
+        if twin:
+            print("already in %s: [%d] %s — use that instance (`arr %s ...`)" % (
+                other, twin["id"], twin["title"], other))
+            return
+    if "--dry-run" in flags:
+        ids = ("tvdb=%s" % pick.get("tvdbId")) if is_series else ("tmdb=%s" % pick.get("tmdbId"))
+        print("DRY: would add %s (%s) %s to %s [seasons=%s search=%s]" % (
+            pick.get("title"), pick.get("year"), ids, svc,
+            flags.get("--seasons", "all") if is_series else "-",
+            "--no-search" not in flags))
+        return
+    created = _do_add(svc, pick, seasons_spec=flags.get("--seasons", "all"),
+                      quality=flags.get("--quality"), root=flags.get("--root"),
+                      search="--no-search" not in flags)
+    if flags.get("--requester"):
+        _tag_requester(svc, str(created["id"]), flags["--requester"])
+        print("  tagged requester:%s (download-notifier will DM them)" % flags["--requester"])
+
+
+def cmd_replace(svc, args):
+    """Swap a wrong movie for the right one in one step.
+
+    arr radarr replace <old id|query> <correct title...> [--tmdb ID] [--year Y] [--yes]
+    Deletes the old movie + file, adds the correct match (same strict
+    disambiguation as `add`), carries any requester-* tag over, searches.
+    Dry-run unless --yes. (The Les Visiteurs German→French class of fix.)"""
+    if svc != "radarr":
+        die("replace: radarr only")
+    flags, rest = pop_flags(args, {"--tmdb": 1, "--year": 1, "--yes": 0})
+    if len(rest) < 2:
+        die("replace: usage: arr radarr replace <old id|query> <correct title...> "
+            "[--tmdb ID] [--year Y] [--yes]")
+    old = api("radarr", "GET", "/movie/%d" % resolve_id("radarr", rest[0]))
+    pick = _lookup_pick("radarr", " ".join(rest[1:]),
+                        tmdb=int(flags["--tmdb"]) if flags.get("--tmdb") else None,
+                        year=int(flags["--year"]) if flags.get("--year") else None)
+    if pick.get("tmdbId") == old.get("tmdbId"):
+        die("replace: that's the same movie (tmdb %s)" % old.get("tmdbId"))
+    go = "--yes" in flags
+    print("%sREPLACE [%d] %s (%s, %sGB on disk)" % (
+        "" if go else "[dry-run] ", old["id"], old["title"], old.get("year"), gb(old.get("sizeOnDisk"))))
+    print("    with  %s (%s) tmdb=%s" % (pick.get("title"), pick.get("year"), pick.get("tmdbId")))
+    if not go:
+        print("  (pass --yes to delete the old movie + file and add the new one)")
+        return
+    labels = []
+    if old.get("tags"):
+        all_tags = {t["id"]: t.get("label", "") for t in api("radarr", "GET", "/tag") or []}
+        labels = [all_tags[t] for t in old["tags"] if all_tags.get(t, "").startswith("requester-")]
+    api("radarr", "DELETE", "/movie/%d?deleteFiles=true" % old["id"])
+    print("deleted old movie + file")
+    created = _do_add("radarr", pick)
+    for lbl in labels:
+        tid = _ensure_tag("radarr", lbl)
+        api("radarr", "PUT", "/movie/editor",
+            {"movieIds": [created["id"]], "tags": [tid], "applyTags": "add"})
+        print("  carried tag %s over" % lbl)
+
+
+# --- media track inspection (ffprobe) -----------------------------------------
+LANG_ALIASES = {"en": "eng", "ja": "jpn", "jp": "jpn", "fr": "fre", "fra": "fre",
+                "de": "ger", "deu": "ger", "ko": "kor", "zh": "chi", "zho": "chi",
+                "es": "spa", "it": "ita", "pt": "por", "ru": "rus"}
+
+
+def _norm_lang(l):
+    l = (l or "und").lower()
+    return LANG_ALIASES.get(l, l)
+
+
+def _ffprobe_streams(path):
+    exe = shutil.which("ffprobe")
+    if not exe:
+        die("ffprobe not on PATH — add ffmpeg to environment.systemPackages and rebuild")
+    try:
+        p = subprocess.run([exe, "-v", "error", "-print_format", "json", "-show_streams", path],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout).get("streams") or []
+    except ValueError:
+        return None
+
+
+def _sidecar_subs(path):
+    """External .srt/.ass/... next to the video count as subtitles too."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    out = []
+    try:
+        names = os.listdir(os.path.dirname(path))
+    except OSError:
+        return out
+    for f in names:
+        if not f.startswith(base) or f == os.path.basename(path):
+            continue
+        if not f.lower().endswith((".srt", ".ass", ".ssa", ".sub", ".vtt")):
+            continue
+        parts = f[len(base):].strip(".").lower().split(".")
+        langs = [t for t in parts[:-1] if t.isalpha() and len(t) in (2, 3)
+                 and t not in ("sdh", "cc", "hi")]
+        out.append({"lang": _norm_lang(langs[0] if langs else None),
+                    "codec": "sidecar-" + parts[-1], "default": False,
+                    "forced": "forced" in parts})
+    return out
+
+
+def _file_tracks(path):
+    """(audio_tracks, sub_tracks, readable) for one video file."""
+    streams = _ffprobe_streams(path)
+    audio, subs = [], []
+    for st in streams or []:
+        tags = st.get("tags") or {}
+        disp = st.get("disposition") or {}
+        ent = {"lang": _norm_lang(tags.get("language")), "codec": st.get("codec_name"),
+               "default": bool(disp.get("default")), "forced": bool(disp.get("forced"))}
+        if st.get("codec_type") == "audio":
+            audio.append(ent)
+        elif st.get("codec_type") == "subtitle":
+            subs.append(ent)
+    subs += _sidecar_subs(path)
+    return audio, subs, streams is not None
+
+
+def _item_files(svc, iid, season=None):
+    """[(label, abspath)] for an item's on-disk files."""
+    out = []
+    if svc.startswith("sonarr"):
+        s = api(svc, "GET", "/series/%d" % iid)
+        for f in api(svc, "GET", "/episodefile?seriesId=%d" % iid) or []:
+            if season is not None and f.get("seasonNumber") != season:
+                continue
+            path = f.get("path") or os.path.join(s.get("path", ""), f.get("relativePath", ""))
+            out.append((f.get("relativePath") or path, path))
+    else:
+        for f in api("radarr", "GET", "/moviefile?movieId=%d" % iid) or []:
+            out.append((f.get("relativePath") or f.get("path"), f.get("path")))
+    out.sort()
+    return out
+
+
+def _fmt_tracks(tr):
+    return ",".join("%s%s(%s)" % (t["lang"], "*" if t["default"] else "", t["codec"])
+                    for t in tr) or "-"
+
+
+def cmd_tracks(svc, args):
+    """Audio + subtitle tracks per file — embedded (ffprobe) and sidecar subs.
+
+    arr <svc> tracks <id|query> [--season N] [--missing-audio LANG]
+        [--missing-subs LANG] [--json]
+    LANG is ISO 639-2 (eng/jpn/fre...; 2-letter forms normalized). Answers
+    "which NANA eps lack an English dub" / "which files have no English subs"
+    in one command instead of a nix-shell ffprobe loop. '*' marks the default
+    track (a non-eng default is the Loki-S1E6 class of bug)."""
+    if not (svc.startswith("sonarr") or svc == "radarr"):
+        die("tracks: sonarr/sonarr-anime/radarr only")
+    flags, rest = pop_flags(args, {"--season": 1, "--missing-audio": 1,
+                                   "--missing-subs": 1, "--json": 0})
+    if not rest:
+        die("tracks: need an id or query")
+    season = int(flags["--season"]) if "--season" in flags else None
+    iid = resolve_id(svc, rest[0])
+    files = _item_files(svc, iid, season)
+    if not files:
+        die("tracks: no files on disk for that item")
+    want_a = _norm_lang(flags["--missing-audio"]) if flags.get("--missing-audio") else None
+    want_s = _norm_lang(flags["--missing-subs"]) if flags.get("--missing-subs") else None
+    rows, flagged, unreadable = [], 0, 0
+    for label, path in files:
+        audio, subs, ok = _file_tracks(path)
+        if not ok:
+            unreadable += 1
+            print("  ?? unreadable: %s" % label)
+            continue
+        rows.append({"file": label, "audio": audio, "subs": subs})
+        miss_a = want_a and not any(t["lang"] == want_a for t in audio)
+        miss_s = want_s and not any(t["lang"] == want_s for t in subs)
+        if (want_a or want_s) and not (miss_a or miss_s):
+            continue
+        flagged += 1
+        if "--json" not in flags:
+            print("  %s" % label)
+            print("      audio: %s   subs: %s" % (_fmt_tracks(audio), _fmt_tracks(subs)))
+    if "--json" in flags:
+        print(json.dumps(rows, indent=2))
+        return
+    if want_a or want_s:
+        what = " / ".join(x for x in
+                          ("audio:%s" % want_a if want_a else None,
+                           "subs:%s" % want_s if want_s else None) if x)
+        print("%d/%d file(s) missing %s%s" % (
+            flagged, len(rows), what, "; %d unreadable" % unreadable if unreadable else ""))
+    else:
+        print("(%d file(s)%s)" % (len(rows), "; %d unreadable" % unreadable if unreadable else ""))
+
+
+def _verify_lang(files, want_a=None, want_s=None):
+    n, miss_a, miss_s = 0, [], []
+    for label, path in files:
+        audio, subs, ok = _file_tracks(path)
+        if not ok:
+            continue
+        n += 1
+        if want_a and not any(t["lang"] == want_a for t in audio):
+            miss_a.append(label)
+        if want_s and not any(t["lang"] == want_s for t in subs):
+            miss_s.append(label)
+    return n, miss_a, miss_s
+
+
+# --- watch (one-shot cron watchdog) --------------------------------------------
+def _jf_find_item(item, is_series):
+    """Find the arr item in Jellyfin by provider id, client-side (10.11's
+    AnyProviderIdEquals filter is broken — same approach as download-notifier)."""
+    r = jf_api("/Items", {"IncludeItemTypes": "Series" if is_series else "Movie",
+                          "Recursive": "true", "Fields": "ProviderIds",
+                          "Limit": "100000"}, soft=True) or {}
+    want = {}
+    if item.get("tvdbId"):
+        want["Tvdb"] = str(item["tvdbId"])
+    if item.get("tmdbId"):
+        want["Tmdb"] = str(item["tmdbId"])
+    if item.get("imdbId"):
+        want["Imdb"] = str(item["imdbId"])
+    for it in r.get("Items") or []:
+        pids = it.get("ProviderIds") or {}
+        for k, v in want.items():
+            if str(pids.get(k) or "") == v:
+                return it
+    return None
+
+
+def _latest_history_date(svc, iid):
+    if svc.startswith("sonarr"):
+        rows = api(svc, "GET", "/history/series?seriesId=%d" % iid) or []
+    else:
+        data = api(svc, "GET", "/history?pageSize=100&sortKey=date&sortDirection=descending")
+        rows = [r for r in data["records"] if r.get("movieId") == iid]
+    dates = sorted((r.get("date") or "" for r in rows), reverse=True)
+    return dates[0] if dates and dates[0] else None
+
+
+def cmd_watch(svc, args):
+    """One-shot readiness check — THE generic replacement for per-title
+    watch-*.sh watchdog scripts. Run it from a Hermes script-only cron job.
+
+    arr <svc> watch <id|query> [--season N] [--until on-disk|in-jellyfin]
+        [--verify-audio LANG] [--verify-subs LANG] [--max-age HOURS] [--quiet]
+
+    With --quiet it prints NOTHING while a download is progressing normally
+    (a script-only cron delivers stdout only when non-empty), and reports on
+    the state changes that matter:
+      READY    exit 0   done (incl. optional Jellyfin visibility + track checks)
+      pending  exit 1   still downloading / not indexed yet (silent w/ --quiet)
+      STUCK    exit 3   a queue item needs intervention (points at stuck --fix)
+      STALLED  exit 4   nothing queued, gaps remain, no activity in --max-age h"""
+    if not (svc.startswith("sonarr") or svc == "radarr"):
+        die("watch: sonarr/sonarr-anime/radarr only")
+    flags, rest = pop_flags(args, {"--season": 1, "--until": 1, "--verify-audio": 1,
+                                   "--verify-subs": 1, "--max-age": 1, "--quiet": 0})
+    if not rest:
+        die("watch: need an id or query")
+    quiet = "--quiet" in flags
+    until = flags.get("--until", "on-disk")
+    if until not in ("on-disk", "in-jellyfin"):
+        die("watch: --until on-disk|in-jellyfin")
+    season = int(flags["--season"]) if "--season" in flags else None
+    is_series = svc.startswith("sonarr")
+    iid = resolve_id(svc, rest[0])
+    item = api(svc, "GET", "/%s/%d" % ("series" if is_series else "movie", iid))
+    q = _queue_records(svc, page_size=1000)["records"]
+    if is_series:
+        mine = [r for r in q if (r.get("seriesId") or (r.get("series") or {}).get("id")) == iid]
+    else:
+        mine = [r for r in q if ((r.get("movie") or {}).get("id") or r.get("movieId")) == iid]
+    stuck = [r for r in mine if _is_stuck_queue_record(r)]
+    if stuck:
+        print("STUCK: %s — %d queue item(s) need intervention:" % (item["title"], len(stuck)))
+        for r in stuck:
+            print("  %s/%s  %s" % (r.get("status"), r.get("trackedDownloadState"),
+                                   (r.get("title") or "")[:70]))
+            msgs = _queue_status_messages(r)
+            if msgs:
+                print("    " + "; ".join(msgs)[:220])
+        print("  -> arr %s stuck '%s' --fix" % (svc, item["title"]))
+        sys.exit(3)
+    if is_series:
+        _, rows = _series_coverage(svc, iid, series=item)
+        if season is not None:
+            rows = [d for d in rows if d["season"] == season]
+        missing = sum(len(d["missing"]) for d in rows if d["season"] != 0 or season == 0)
+        have = sum(d["files"] for d in rows)
+        done = missing == 0 and have > 0 and not mine
+        prog_desc = "%d aired monitored ep(s) still missing" % missing
+    else:
+        done = bool(item.get("hasFile")) and not mine
+        prog_desc = "file not on disk yet"
+    if not done:
+        if mine:
+            size = sum(r.get("size") or 0 for r in mine)
+            left = sum(r.get("sizeleft") or 0 for r in mine)
+            pct = int(100 * (1 - left / size)) if size else 0
+            if not quiet:
+                print("downloading: %s — %d item(s), %d%% (%sMB left)" % (
+                    item["title"], len(mine), pct, mb(left)))
+            sys.exit(1)
+        if flags.get("--max-age"):
+            last = _latest_history_date(svc, iid)
+            cutoff = time.strftime("%Y-%m-%dT%H:%M:%S",
+                                   time.gmtime(time.time() - float(flags["--max-age"]) * 3600))
+            if not last or last[:19] < cutoff:
+                print("STALLED: %s — %s; queue empty, no activity in %sh (last: %s)" % (
+                    item["title"], prog_desc, flags["--max-age"], (last or "never")[:19]))
+                print("  -> re-grab: arr %s grab %d%s" % (
+                    svc, iid, (" --season %d" % season) if season is not None else ""))
+                sys.exit(4)
+        if not quiet:
+            print("pending: %s — %s, nothing in queue" % (item["title"], prog_desc))
+        sys.exit(1)
+    if until == "in-jellyfin":
+        jf = _jf_find_item(item, is_series)
+        if not jf:
+            jf_api("/Library/Refresh", method="POST", soft=True)  # nudge the scan
+            if not quiet:
+                print("imported: %s — waiting for Jellyfin to index it (refresh nudged)" % item["title"])
+            sys.exit(1)
+    lines = ["READY: %s (%s)" % (item["title"], item.get("year"))]
+    if flags.get("--verify-audio") or flags.get("--verify-subs"):
+        wa = _norm_lang(flags["--verify-audio"]) if flags.get("--verify-audio") else None
+        ws = _norm_lang(flags["--verify-subs"]) if flags.get("--verify-subs") else None
+        n, ma, ms = _verify_lang(_item_files(svc, iid, season), wa, ws)
+        if wa:
+            lines.append("  audio %s: %d/%d file(s) ok%s" % (
+                wa, n - len(ma), n, ("; MISSING: " + ", ".join(ma[:5])) if ma else ""))
+        if ws:
+            lines.append("  subs %s: %d/%d file(s) ok%s" % (
+                ws, n - len(ms), n, ("; MISSING: " + ", ".join(ms[:5])) if ms else ""))
+    print("\n".join(lines))
+
+
+# --- release audio-language heuristics ----------------------------------------
+AUDIO_MARKERS = {
+    "eng": ("dual audio", "dual-audio", "dualaudio", "dual]", "english dub",
+            "eng dub", "engdub", "english audio", "dubbed", "multi audio",
+            "multi-audio", "multi]"),
+    "dual": ("dual audio", "dual-audio", "dualaudio", "dual]", "multi audio",
+             "multi-audio"),
+}
+
+
+def _audio_match(title, lang):
+    t = (title or "").lower()
+    return any(m in t for m in AUDIO_MARKERS.get(lang, (lang,)))
+
+
+
 def sab_queue(args):
     q = sab_api("queue", {"limit": "500"})["queue"]
     pat = args[0].lower() if args else None
@@ -1338,10 +2190,159 @@ def seerr_request(args):
     print(json.dumps(seerr_api("/request/%s" % args[0]), indent=2))
 
 
-SEERR_COMMANDS = {"requests": seerr_requests, "request": seerr_request}
+def seerr_unfulfilled(args):
+    """Requests whose REQUESTED content isn't actually on disk — judged against
+    Sonarr/Sonarr-anime/Radarr season stats, not Seerr's own cached status.
+
+    arr seerr unfulfilled [--fix] [--json] [--quiet]
+    Also flags DIVERGED rows: Seerr says pending/partial but the requested
+    seasons are complete (Seerr's whole-series status lies for season requests).
+    --fix triggers arr-side searches (SeasonSearch/MoviesSearch) for the gaps."""
+    flags, _ = pop_flags(args, {"--fix": 0, "--json": 0, "--quiet": 0})
+    data = seerr_api("/request", {"take": "300", "skip": "0", "sort": "added"})
+    movies = {m.get("tmdbId"): m for m in api("radarr", "GET", "/movie") or []}
+    series_by_tvdb = {}
+    for inst in ("sonarr", "sonarr-anime"):
+        for s in api(inst, "GET", "/series") or []:
+            series_by_tvdb.setdefault(s.get("tvdbId"), (inst, s))
+    mstat = {1: "unknown", 2: "pending", 3: "processing", 4: "partial", 5: "available"}
+    out = []
+    for r in data.get("results", []):
+        if r.get("status") == 3:  # declined
+            continue
+        m = r.get("media") or {}
+        mtype = m.get("mediaType")
+        title = m.get("title") or _seerr_title(mtype, m.get("tmdbId")) or "tmdb:%s" % m.get("tmdbId")
+        row = {"id": r.get("id"), "title": title, "type": mtype,
+               "by": (r.get("requestedBy") or {}).get("displayName", "?"),
+               "seerr": mstat.get(m.get("status"), m.get("status")), "fix": None}
+        if mtype == "movie":
+            mv = movies.get(m.get("tmdbId"))
+            if mv and mv.get("hasFile"):
+                if m.get("status") != 5:
+                    row["state"] = "DIVERGED — on disk but Seerr says %s" % row["seerr"]
+                    out.append(row)
+                continue
+            if mv:
+                row["state"] = "missing (radarr id %d)" % mv["id"]
+                row["fix"] = ("radarr", mv["id"])
+            else:
+                row["state"] = "NOT IN RADARR"
+            out.append(row)
+        else:
+            hit = series_by_tvdb.get(m.get("tvdbId"))
+            want = sorted(x.get("seasonNumber") for x in (r.get("seasons") or [])
+                          if x.get("seasonNumber") is not None)
+            if not hit:
+                row["state"] = "NOT IN SONARR%s" % (
+                    " (requested S%s)" % ",".join(map(str, want)) if want else "")
+                out.append(row)
+                continue
+            inst, s = hit
+            gaps = []
+            for se in s.get("seasons") or []:
+                sn = se["seasonNumber"]
+                if want and sn not in want:
+                    continue
+                if sn == 0 and not want:
+                    continue
+                st = se.get("statistics") or {}
+                have, aired = st.get("episodeFileCount", 0), st.get("episodeCount", 0)
+                if have < aired:
+                    gaps.append((sn, have, aired))
+            if not gaps:
+                if m.get("status") != 5:
+                    row["state"] = ("DIVERGED — requested seasons complete (%s) but Seerr says %s"
+                                    % (inst, row["seerr"]))
+                    out.append(row)
+                continue
+            row["state"] = "gaps: " + ", ".join("S%d %d/%d" % g for g in gaps)
+            row["fix"] = (inst, s["id"], [g[0] for g in gaps])
+            out.append(row)
+    if "--json" in flags:
+        print(json.dumps(out, indent=2))
+        return
+    if not out:
+        if "--quiet" not in flags:
+            print("unfulfilled: none — every non-declined request is on disk")
+        return
+    print("unfulfilled/diverged: %d request(s)" % len(out))
+    for row in out:
+        print("  #%-4s %-38s [%-5s] by %-12s %s" % (
+            row["id"], str(row["title"])[:38], row["type"], row["by"][:12], row["state"]))
+    if "--fix" not in flags:
+        return
+    print("fixes:")
+    for row in out:
+        f = row.get("fix")
+        if not f:
+            continue
+        if f[0] == "radarr":
+            r2 = api("radarr", "POST", "/command", {"name": "MoviesSearch", "movieIds": [f[1]]})
+            print("  #%s %s: MoviesSearch queued (cmd %s)" % (row["id"], str(row["title"])[:30], r2["id"]))
+        else:
+            inst, sid2, seas = f
+            for sn in seas:
+                r2 = api(inst, "POST", "/command",
+                         {"name": "SeasonSearch", "seriesId": sid2, "seasonNumber": sn})
+                print("  #%s %s S%d: SeasonSearch queued on %s (cmd %s)" % (
+                    row["id"], str(row["title"])[:30], sn, inst, r2["id"]))
 
 
-JELLYFIN_COMMANDS = {"unwatched": cmd_jf_unwatched}
+def _jf_search_items(term, limit=10):
+    r = jf_api("/Items", {"searchTerm": term, "Recursive": "true",
+                          "IncludeItemTypes": "Movie,Series",
+                          "Fields": "Path,ProviderIds", "Limit": str(limit)}, soft=True) or {}
+    return r.get("Items") or []
+
+
+def cmd_jf_has(args):
+    """arr jellyfin has <title> — is it visible in the Jellyfin library NOW?
+    (What users see; an arr import isn't 'ready' until this says yes.)"""
+    if not args:
+        die("jellyfin has: need a title")
+    term = " ".join(args)
+    hits = _jf_search_items(term)
+    if not hits:
+        print("not in Jellyfin: %s" % term)
+        sys.exit(1)
+    for it in hits:
+        extra = ""
+        if it.get("Type") == "Series":
+            eps = jf_api("/Shows/%s/Episodes" % it["Id"], {"Limit": "1"}, soft=True)
+            if eps and eps.get("TotalRecordCount") is not None:
+                extra = "  %s episode(s)" % eps["TotalRecordCount"]
+        print("  [%s] %s (%s)%s" % (it.get("Type"), it.get("Name"), it.get("ProductionYear"), extra))
+        if it.get("Path"):
+            print("      %s" % it["Path"])
+
+
+def cmd_jf_refresh(args):
+    """arr jellyfin refresh [--wait <title>] [--timeout SECS] — trigger a library
+    scan; --wait polls until <title> is searchable (replaces curl+sleep loops)."""
+    flags, _ = pop_flags(args, {"--wait": 1, "--timeout": 1})
+    jf_api("/Library/Refresh", method="POST")
+    print("library refresh triggered")
+    if not flags.get("--wait"):
+        return
+    term = flags["--wait"]
+    deadline = time.time() + int(flags.get("--timeout", "300"))
+    while time.time() < deadline:
+        hits = _jf_search_items(term, limit=5)
+        if hits:
+            print("visible in Jellyfin: %s (%s)" % (hits[0].get("Name"), hits[0].get("Type")))
+            return
+        time.sleep(5)
+    print("timeout: '%s' not visible after %ss" % (term, flags.get("--timeout", "300")))
+    sys.exit(2)
+
+
+SEERR_COMMANDS = {"requests": seerr_requests, "request": seerr_request,
+                  "unfulfilled": seerr_unfulfilled}
+
+
+JELLYFIN_COMMANDS = {"unwatched": cmd_jf_unwatched, "has": cmd_jf_has,
+                     "refresh": cmd_jf_refresh}
 
 
 COMMANDS = {
@@ -1354,6 +2355,8 @@ COMMANDS = {
     "files": cmd_files, "delete": cmd_delete,
     "availability": cmd_availability, "lookup": cmd_lookup, "info": cmd_info,
     "tag": cmd_tag, "raw": cmd_raw,
+    "add": cmd_add, "coverage": cmd_coverage, "tracks": cmd_tracks,
+    "watch": cmd_watch, "replace": cmd_replace,
 }
 
 USAGE = """arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
@@ -1365,9 +2368,38 @@ USAGE = """arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
 
 Commands (sonarr & radarr unless noted):
   status [query]                  list items (optionally filter by title)
+        a single-match sonarr status also prints per-season coverage flags,
+        so "do we have X?" surfaces partially-downloaded seasons by itself
+  add <title> [--year Y] [--tvdb/--tmdb ID] [--seasons all|s1,s2|none]
+        [--quality NAME] [--root PATH] [--no-search] [--requester <discordId>]
+        [--dry-run]
+        add by title. REFUSES ambiguous matches (lists candidates — narrow by
+        --year/--tvdb/--tmdb; the wrong-Gloria guard). If already in the
+        library, prints its per-season coverage instead of adding. Defaults:
+        monitor all regular seasons, library-majority quality profile, search
+        immediately. --requester wires up the download-notifier DM.
+  coverage <id|query> [--fix] [--dry-run]   (sonarr)
+  coverage --all [--fix] [--quiet] [--limit N]
+        per-season gaps vs AIRED episodes. --fix searches missing MONITORED
+        eps (partial season -> EpisodeSearch, empty -> SeasonSearch);
+        unmonitored seasons are only reported — ask the requester first.
+        --all sweeps every monitored series (cron this; --quiet = silent when clean)
+  tracks <id|query> [--season N] [--missing-audio LANG] [--missing-subs LANG] [--json]
+        audio/sub tracks per file via ffprobe + sidecar .srt detection.
+        `tracks NANA --missing-audio eng` = which eps lack an English dub;
+        '*' marks the default track (catches wrong-default-audio bugs)
+  watch <id|query> [--season N] [--until on-disk|in-jellyfin] [--verify-audio L]
+        [--verify-subs L] [--max-age H] [--quiet]
+        one-shot readiness check for cron watchdogs — silent while a download
+        progresses (--quiet), reports READY/STUCK/STALLED. exit: 0 ready,
+        1 pending, 3 stuck, 4 stalled. Replaces per-title watch-*.sh scripts.
+  replace <old id|query> <correct title...> [--tmdb ID] [--year Y] [--yes]  (radarr)
+        delete wrong movie+file, add the right one, carry requester tag, search.
+        dry-run unless --yes (the German-Les-Visiteurs fix)
   get <id|query>                  full JSON for one item
   seasons <id|query>              (sonarr) per-season monitored + on-disk
-  releases <id|query> [--season N|--episode EPID]
+  releases <id|query> [--season N|--episode EPID] [--audio eng|dual]
+        (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi)
   grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run] [--wait]
         no flags: search & let the arr decide (respects quality profile)
         --override: force-push every candidate release (bypass rejections)
@@ -1390,18 +2422,21 @@ Commands (sonarr & radarr unless noted):
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
   parse "<release title>"         show how the arr maps a title (series+episode)
   import <folder> --series <id|query> [--match SUBSTR] [--season N]
-        [--map auto|abs|se] [--mode copy|move] [--dry-run] [--wait]   (sonarr)
+        [--map auto|abs|se] [--mode copy|move] [--batch N] [--dry-run] [--wait]  (sonarr)
         force-import files into episodes, bypassing name matching (maps by
         absolute/SxxExx number). --match filters filenames (USE IT in a shared
         download folder, or every file gets mapped onto this series).
+        Chunks --batch files per API call (default 10) so big imports can't time out.
   import <folder> --movie <id|query> [--match SUBSTR] [--mode copy|move]
         [--dry-run] [--wait]   (radarr) force-import file(s) into a movie
   queue [query]                    show download queue
   queue-rm <id|pat> [--blocklist] [--keep-files] [--yes]   remove queue record(s)
         via API (dry-run unless --yes); default also removes from download client
-  stuck [query] [--json|--quiet]   queue items needing intervention (failed/import-blocked/pending)
+  stuck [query] [--json|--quiet] [--fix [--yes]]   queue items needing intervention
+        --fix: auto-plan force-imports for import-blocked items (applies w/ --yes);
+        failed items get a suggested queue-rm+re-grab line
   history [id|query] | wanted
-  search <query> [--group X] [--indexer Y] [--limit N] [--json]   (prowlarr)
+  search <query> [--group X] [--indexer Y] [--limit N] [--audio eng|dual] [--json]  (prowlarr)
   grab <query> [--indexer X] [--group/--match Y] [--cat C] [--all] [--dry-run]
         (prowlarr) grab a matched release to the right client by protocol:
         usenet -> SABnzbd, torrent -> qBittorrent. Refuses >1 match w/o --all.
@@ -1413,8 +2448,13 @@ SABnzbd:
 
 Jellyfin / Seerr:
   arr jellyfin unwatched [--min-seasons N]   series on disk no user has watched
+  arr jellyfin has <title>                   is it visible in the library NOW?
+  arr jellyfin refresh [--wait <title>] [--timeout S]   trigger scan (+poll until visible)
   arr seerr requests [--pending] [query]     who requested what (+ media status)
   arr seerr request <id>                     full request detail
+  arr seerr unfulfilled [--fix] [--json] [--quiet]   requests vs ACTUAL disk state
+        (cross-checked against the arrs; flags Seerr-says-partial-but-complete
+        divergences; --fix triggers arr-side searches for real gaps)
 
 Keys come from $ARR_API_KEY_<SVC> / $ARR_API_KEY_{SAB,JELLYFIN,SEERR} or the
 sops-rendered env file (%s). No sudo required.""" % ENV_FILE
@@ -1435,7 +2475,7 @@ def main(argv):
         return
     if svc == "jellyfin":
         if len(argv) < 2:
-            die("jellyfin: unwatched")
+            die("jellyfin: unwatched|has|refresh")
         fn = JELLYFIN_COMMANDS.get(argv[1])
         if not fn:
             die("unknown jellyfin command '%s'" % argv[1])
@@ -1443,7 +2483,7 @@ def main(argv):
         return
     if svc == "seerr":
         if len(argv) < 2:
-            die("seerr: requests|request")
+            die("seerr: requests|request|unfulfilled")
         fn = SEERR_COMMANDS.get(argv[1])
         if not fn:
             die("unknown seerr command '%s'" % argv[1])
