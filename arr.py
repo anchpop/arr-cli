@@ -345,13 +345,15 @@ def cmd_status(svc, args):
             if len(matches) == 1:
                 for ln in _season_gap_lines(svc, s):
                     print(ln)
+                _audit_warn(svc, s["id"], item=s)
     elif svc == "radarr":
         items = sorted(api(svc, "GET", "/movie"), key=lambda x: x["title"])
-        for m in items:
-            if q and q not in m["title"].lower():
-                continue
+        matches = [m for m in items if not q or q in m["title"].lower()]
+        for m in matches:
             disk = "ON DISK (%sGB)" % gb(m.get("sizeOnDisk")) if m.get("hasFile") else "MISSING"
             print("[%d] %s (%s) — %s, mon=%s, %s" % (m["id"], m["title"], m.get("year"), m["status"], m["monitored"], disk))
+            if len(matches) == 1:
+                _audit_warn(svc, m["id"], item=m)
     else:
         die("status: sonarr|radarr only")
 
@@ -394,8 +396,9 @@ SEARCH_TIMEOUT = 300  # interactive indexer searches (/release) can take minutes
 
 
 def cmd_releases(svc, args):
-    aflags, args = pop_flags(args, {"--audio": 1})
-    rels = api(svc, "GET", "/release?" + _release_query(svc, args), timeout=SEARCH_TIMEOUT)
+    aflags, args = pop_flags(args, {"--audio": 1, "--timeout": 1})
+    rels = api(svc, "GET", "/release?" + _release_query(svc, args),
+               timeout=int(aflags.get("--timeout", SEARCH_TIMEOUT)))
     if aflags.get("--audio"):
         want = _norm_lang(aflags["--audio"])
         rels = [r for r in rels if _audio_match(r.get("title"), want)]
@@ -1346,6 +1349,7 @@ def cmd_coverage(svc, args):
             _coverage_fix(svc, sid, fixable, dry="--dry-run" in flags)
         else:
             print("  => fixable gaps in monitored seasons: rerun with --fix to trigger searches")
+    _audit_warn(svc, sid, item=s)
     if "--tracks" not in flags and "--fix-subs" not in flags:
         return
     lang = _norm_lang(flags.get("--lang", "eng"))
@@ -1547,10 +1551,15 @@ def cmd_add(svc, args):
                       "`arr %s monitor %d s...` + `coverage --fix`" % (svc, existing["id"]))
             if not fixable and not askable:
                 print("  => complete: all monitored aired episodes on disk")
+            _audit_warn(svc, existing["id"], item=existing)
+            print("  => dub/sub state NOT checked here — run `arr %s coverage %d"
+                  " --tracks` and report eng audio/sub gaps too (do this"
+                  " unprompted for anime)" % (svc, existing["id"]))
         else:
             print("  " + ("ON DISK (%sGB)" % gb(existing.get("sizeOnDisk"))
                           if existing.get("hasFile") else
                           "no file yet — `arr radarr grab %d` re-searches" % existing["id"]))
+            _audit_warn(svc, existing["id"], item=existing)
         return
     # a series might live in the OTHER sonarr instance (anime vs normal)
     if is_series and pick.get("tvdbId"):
@@ -2065,6 +2074,232 @@ def cmd_files(svc, args):
             print("  %sGB  %s  %s" % (gb(f.get("size")), _qname(f), f.get("relativePath") or f.get("path")))
 
 
+# --- disk audit: unmanaged files = Jellyfin duplicates ------------------------
+VIDEO_EXTS = (".mkv", ".mp4", ".m4v", ".avi", ".m2ts", ".ts", ".wmv", ".mov",
+              ".webm", ".mpg", ".mpeg")
+SIDECAR_EXTS = (".srt", ".ass", ".ssa", ".sub", ".idx", ".vtt", ".nfo")
+QUARANTINE_ROOT = "/data/hermes/quarantine"
+
+
+def _guess_ep(name):
+    m = re.search(r"[Ss](\d{1,2})[Ee](\d{1,3})", name)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _walk_videos(root):
+    out = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for f in files:
+            if f.lower().endswith(VIDEO_EXTS):
+                out.append(os.path.join(dirpath, f))
+    return out
+
+
+def _disk_audit(svc, iid, item=None):
+    """Compare video files ON DISK under an item's folder with the files the arr
+    TRACKS. Anything untracked is what makes Jellyfin show duplicate episodes /
+    a wrong 'first episode' (e.g. a leftover Crunchyroll WEB-DL next to the
+    Sonarr-managed file). Returns (item, unmanaged|None); None = folder not
+    visible from here (can't audit). Each unmanaged entry:
+    {path, size, ep:(s,e)|None, dup_of: tracked relativePath|None, sidecars:[]}."""
+    is_series = svc.startswith("sonarr")
+    if is_series:
+        item = item or api(svc, "GET", "/series/%d" % iid)
+        recs = api(svc, "GET", "/episodefile?seriesId=%d" % iid) or []
+    else:
+        item = item or api("radarr", "GET", "/movie/%d" % iid)
+        recs = api("radarr", "GET", "/moviefile?movieId=%d" % iid) or []
+    root = item.get("path") or ""
+    if not root or not os.path.isdir(root):
+        return item, None
+    tracked, by_ep = set(), {}
+    for f in recs:
+        p = f.get("path") or os.path.join(root, f.get("relativePath", ""))
+        tracked.add(os.path.realpath(p))
+        ep = _guess_ep(f.get("relativePath") or "") if is_series else None
+        if ep:
+            by_ep[ep] = f.get("relativePath")
+    unmanaged = []
+    folder = os.path.basename(root.rstrip("/"))
+    for p in _walk_videos(root):
+        if os.path.realpath(p) in tracked:
+            continue
+        ep = _guess_ep(os.path.basename(p)) if is_series else None
+        version = False
+        if is_series:
+            dup = by_ep.get(ep) if ep else None
+        else:  # any extra video beside a tracked movie file duplicates it
+            dup = (recs[0].get("relativePath") or recs[0].get("path")) if recs else None
+            # "Movie (Year) - Some Label.mkv" beside the folder of the same name
+            # is Jellyfin's INTENTIONAL multi-version convention (shows a version
+            # picker, not a duplicate) — flag it, don't treat it as junk.
+            stem = os.path.splitext(os.path.basename(p))[0]
+            version = stem.startswith(folder + " - ")
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            size = 0
+        base = os.path.splitext(os.path.basename(p))[0]
+        side = []
+        try:
+            for g in os.listdir(os.path.dirname(p)):
+                if (g != os.path.basename(p) and g.startswith(base)
+                        and g.lower().endswith(SIDECAR_EXTS)):
+                    side.append(os.path.join(os.path.dirname(p), g))
+        except OSError:
+            pass
+        unmanaged.append({"path": p, "size": size, "ep": ep, "dup_of": dup,
+                          "version": version, "sidecars": sorted(side)})
+    return item, sorted(unmanaged, key=lambda u: u["path"])
+
+
+def _audit_warn(svc, iid, item=None):
+    """Piggybacked proactive check for status/coverage/add — never raises."""
+    try:
+        _, un = _disk_audit(svc, iid, item=item)
+    except Exception:
+        return
+    un = [u for u in (un or []) if not u.get("version")]
+    if not un:
+        return
+    dups = sum(1 for u in un if u["dup_of"])
+    print("  ⚠ %d unmanaged video file(s) on disk that %s does NOT track%s" % (
+        len(un), svc, " — %d duplicate an episode/movie already on disk" % dups if dups else ""))
+    print("    (Jellyfin will show these as duplicates/wrong versions)"
+          " `arr %s audit %d` to inspect, `--quarantine --yes` to fix" % (svc, iid))
+
+
+def _quarantine_moves(svc, item, unmanaged, dest=None, go=False):
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", item.get("title", "item")).strip("-").lower()
+    dest = dest or os.path.join(QUARANTINE_ROOT, "%s-%s-%s" % (
+        svc, slug, time.strftime("%Y%m%d")))
+    moved = 0
+    for u in unmanaged:
+        for p in [u["path"]] + u["sidecars"]:
+            if not go:
+                print("  DRY: would move %s -> %s/" % (p, dest))
+                continue
+            os.makedirs(dest, exist_ok=True)
+            tgt = os.path.join(dest, os.path.basename(p))
+            n = 1
+            while os.path.exists(tgt):
+                stem, ext = os.path.splitext(os.path.basename(p))
+                tgt = os.path.join(dest, "%s.%d%s" % (stem, n, ext))
+                n += 1
+            try:
+                os.rename(p, tgt)
+            except OSError as e:
+                die("audit: move failed (%s)\n  media-group write needed — the hermes"
+                    " agent has it; andrep needs the sudo-nix root path" % e)
+            moved += 1
+            print("  moved %s -> %s" % (p, tgt))
+    return dest, moved
+
+
+def cmd_audit(svc, args):
+    """Disk-vs-database audit: video files the arr does NOT track.
+
+    arr <svc> audit <id|query> [--quarantine] [--yes] [--dest DIR] [--json]
+    arr <svc> audit --all [--quiet]
+    Untracked files are what make Jellyfin show duplicate episodes (the leftover
+    "Crunchyroll WEB-DL" ghost next to the managed file), wrong first episodes,
+    etc. --quarantine MOVES them + their sidecar subs into a dated folder under
+    /data/hermes/quarantine (dry-run unless --yes; nothing is deleted — restore
+    = move back), then rescans the arr item and refreshes Jellyfin.
+    --all sweeps the whole library and reports only offenders (cron-friendly)."""
+    if not (svc.startswith("sonarr") or svc == "radarr"):
+        die("audit: sonarr/sonarr-anime/radarr only")
+    flags, rest = pop_flags(args, {"--quarantine": 0, "--yes": 0, "--dest": 1,
+                                   "--json": 0, "--all": 0, "--quiet": 0,
+                                   "--include-versions": 0})
+    is_series = svc.startswith("sonarr")
+    if "--all" in flags:
+        items = api(svc, "GET", "/series" if is_series else "/movie")
+        bad = skipped = 0
+        for it in sorted(items, key=lambda x: x["title"]):
+            try:
+                _, un = _disk_audit(svc, it["id"], item=it)
+            except Exception:
+                un = None
+            if un is None:
+                skipped += 1
+                continue
+            un = [u for u in un if not u.get("version")]
+            if un:
+                bad += 1
+                print("[%d] %s — %d unmanaged file(s), %sGB  (`arr %s audit %d`)" % (
+                    it["id"], it["title"], len(un), gb(sum(u["size"] for u in un)),
+                    svc, it["id"]))
+        if not bad and "--quiet" not in flags:
+            print("audit: no unmanaged files anywhere in %s%s" % (
+                svc, " (%d folders not visible, skipped)" % skipped if skipped else ""))
+        sys.exit(1 if bad else 0)
+    if not rest:
+        die("audit: need <id|query> or --all")
+    iid = resolve_id(svc, rest[0])
+    item, un = _disk_audit(svc, iid)
+    if un is None:
+        die("audit: folder %s not visible from this host — can't audit" % item.get("path"))
+    if "--json" in flags:
+        print(json.dumps(un, indent=2))
+        return
+    print("%s (%s) — %s" % (item["title"], item.get("year"), item.get("path")))
+    if not un:
+        print("  clean: every video file on disk is tracked by %s" % svc)
+        return
+    print("  %d unmanaged video file(s) (%sGB) NOT tracked by %s:" % (
+        len(un), gb(sum(u["size"] for u in un)), svc))
+    unmatched = 0
+    for u in un:
+        ep = "S%02dE%02d" % u["ep"] if u["ep"] else "?"
+        print("    %s  %sMB  %s" % (ep, mb(u["size"]), u["path"]))
+        if u.get("version"):
+            print("          JELLYFIN VERSION ('Title (Year) - Label' naming ="
+                  " intentional version picker) — skipped by --quarantine unless"
+                  " --include-versions")
+        elif u["dup_of"]:
+            print("          DUPLICATE of tracked: %s" % u["dup_of"])
+        else:
+            unmatched += 1
+        for sp in u["sidecars"]:
+            print("          + sidecar: %s" % os.path.basename(sp))
+    if unmatched and is_series:
+        print("  => %d file(s) don't match any tracked episode — if this series"
+              " has coverage gaps they are probably UNIMPORTED episodes:"
+              " check `arr %s coverage %d`, and IMPORT (`arr %s import '%s'"
+              " --series %d --map abs`) instead of quarantining" % (
+                  unmatched, svc, iid, svc, item.get("path", ""), iid))
+    movable = un if "--include-versions" in flags else [u for u in un if not u.get("version")]
+    if "--quarantine" not in flags:
+        if movable:
+            print("  => Jellyfin shows these as duplicate/ghost entries. Rerun with"
+                  " --quarantine [--yes] to move them out (kept, not deleted)")
+        return
+    if not movable:
+        print("  => only intentional version files here — nothing to quarantine"
+              " (override with --include-versions)")
+        return
+    go = "--yes" in flags
+    dest, moved = _quarantine_moves(svc, item, movable, dest=flags.get("--dest"), go=go)
+    if not go:
+        print("  (dry-run — pass --yes to actually move %d file(s) to %s)" % (
+            sum(1 + len(u["sidecars"]) for u in movable), dest))
+        return
+    print("  quarantined %d file(s) -> %s" % (moved, dest))
+    if is_series:
+        api(svc, "POST", "/command", {"name": "RescanSeries", "seriesId": iid})
+    else:
+        api("radarr", "POST", "/command", {"name": "RescanMovie", "movieId": iid})
+    try:
+        jf_api("/Library/Refresh", method="POST")
+        print("  rescan + Jellyfin refresh triggered — verify with"
+              " `arr jellyfin has '%s'`" % item["title"])
+    except SystemExit:
+        print("  arr rescan triggered (Jellyfin refresh failed — run"
+              " `arr jellyfin refresh`)")
+
+
 def cmd_delete(svc, args):
     """Delete media via the arr API (deletes as the service user — no rm/perms
     fight — and updates the DB so it won't silently re-download). Dry-run unless
@@ -2551,7 +2786,7 @@ COMMANDS = {
     "episodes": cmd_episodes, "wait": cmd_wait,
     "history": cmd_history, "wanted": cmd_wanted,
     "parse": cmd_parse, "search": cmd_search, "import": cmd_import,
-    "files": cmd_files, "delete": cmd_delete,
+    "files": cmd_files, "delete": cmd_delete, "audit": cmd_audit,
     "availability": cmd_availability, "lookup": cmd_lookup, "info": cmd_info,
     "tag": cmd_tag, "raw": cmd_raw,
     "add": cmd_add, "coverage": cmd_coverage, "tracks": cmd_tracks,
@@ -2600,8 +2835,9 @@ Commands (sonarr & radarr unless noted):
         dry-run unless --yes (the German-Les-Visiteurs fix)
   get <id|query>                  full JSON for one item
   seasons <id|query>              (sonarr) per-season monitored + on-disk
-  releases <id|query> [--season N|--episode EPID] [--audio eng|dual]
-        (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi)
+  releases <id|query> [--season N|--episode EPID] [--audio eng|dual] [--timeout S]
+        (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi;
+         --timeout: raise past the 300s default — anime searches can exceed it)
   grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run] [--wait]
         no flags: search & let the arr decide (respects quality profile)
         --override: force-push every candidate release (bypass rejections)
@@ -2619,6 +2855,14 @@ Commands (sonarr & radarr unless noted):
   lookup <term>                   TMDB/TVDB metadata search (disambiguate 1990 vs 2003)
   availability <id|query>         is it obtainable? searches the item's own titles + ids
   files <id|query> [--full]       files on disk (path/size/quality)
+  audit <id|query> [--quarantine] [--yes] [--dest DIR] [--json]
+  audit --all [--quiet]
+        disk-vs-DB audit: video files the arr does NOT track (the cause of
+        duplicate episodes / "wrong first episode" in Jellyfin). --quarantine
+        moves them + sidecars to /data/hermes/quarantine (dry-run unless
+        --yes; restore = move back), then rescans arr + Jellyfin.
+        status/coverage/add warn about these automatically for single items;
+        --all sweeps the whole library (exit 1 if offenders found — cron it).
   delete <id|query> ...           DELETE via API (dry-run unless --yes):
         sonarr: --seasons X-Y [--keep-monitored] | --all
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
