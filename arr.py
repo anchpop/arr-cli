@@ -2113,13 +2113,20 @@ def _disk_audit(svc, iid, item=None):
     root = item.get("path") or ""
     if not root or not os.path.isdir(root):
         return item, None
-    tracked, by_ep = set(), {}
+    tracked, by_ep, ep_has_file = set(), {}, {}
     for f in recs:
         p = f.get("path") or os.path.join(root, f.get("relativePath", ""))
         tracked.add(os.path.realpath(p))
-        ep = _guess_ep(f.get("relativePath") or "") if is_series else None
-        if ep:
-            by_ep[ep] = f.get("relativePath")
+    if is_series:
+        # authoritative (season, episode) -> tracked file map from the episode
+        # list, so absolute-numbered anime releases resolve correctly
+        rec_by_id = {f["id"]: f for f in recs}
+        for e in api(svc, "GET", "/episode?seriesId=%d" % iid) or []:
+            key = (e.get("seasonNumber"), e.get("episodeNumber"))
+            ep_has_file[key] = bool(e.get("hasFile"))
+            r = rec_by_id.get(e.get("episodeFileId"))
+            if r:
+                by_ep[key] = r.get("relativePath")
     unmanaged = []
     folder = os.path.basename(root.rstrip("/"))
     for p in _walk_videos(root):
@@ -2128,6 +2135,17 @@ def _disk_audit(svc, iid, item=None):
         ep = _guess_ep(os.path.basename(p)) if is_series else None
         version = False
         if is_series:
+            if ep is None:
+                # no SxxEyy in the name (absolute-numbered anime release) —
+                # let Sonarr's own parser map it, but only trust a same-series hit
+                try:
+                    pr = api(svc, "GET", "/parse?title="
+                             + urllib.parse.quote(os.path.basename(p)))
+                    pes = (pr or {}).get("episodes") or []
+                    if pes and ((pr.get("series") or {}).get("id") == iid):
+                        ep = (pes[0].get("seasonNumber"), pes[0].get("episodeNumber"))
+                except Exception:
+                    pass
             dup = by_ep.get(ep) if ep else None
         else:  # any extra video beside a tracked movie file duplicates it
             dup = (recs[0].get("relativePath") or recs[0].get("path")) if recs else None
@@ -2150,7 +2168,9 @@ def _disk_audit(svc, iid, item=None):
         except OSError:
             pass
         unmanaged.append({"path": p, "size": size, "ep": ep, "dup_of": dup,
-                          "version": version, "sidecars": sorted(side)})
+                          "version": version, "sidecars": sorted(side),
+                          "importable": bool(is_series and ep and dup is None
+                                             and not ep_has_file.get(ep, False))})
     return item, sorted(unmanaged, key=lambda u: u["path"])
 
 
@@ -2250,7 +2270,7 @@ def cmd_audit(svc, args):
         return
     print("  %d unmanaged video file(s) (%sGB) NOT tracked by %s:" % (
         len(un), gb(sum(u["size"] for u in un)), svc))
-    unmatched = 0
+    importable = unknown = 0
     for u in un:
         ep = "S%02dE%02d" % u["ep"] if u["ep"] else "?"
         print("    %s  %sMB  %s" % (ep, mb(u["size"]), u["path"]))
@@ -2260,16 +2280,19 @@ def cmd_audit(svc, args):
                   " --include-versions")
         elif u["dup_of"]:
             print("          DUPLICATE of tracked: %s" % u["dup_of"])
+        elif u.get("importable"):
+            importable += 1
+            print("          UNIMPORTED — maps to %s which has NO tracked file" % ep)
         else:
-            unmatched += 1
-        for sp in u["sidecars"]:
-            print("          + sidecar: %s" % os.path.basename(sp))
-    if unmatched and is_series:
-        print("  => %d file(s) don't match any tracked episode — if this series"
-              " has coverage gaps they are probably UNIMPORTED episodes:"
-              " check `arr %s coverage %d`, and IMPORT (`arr %s import '%s'"
-              " --series %d --map abs`) instead of quarantining" % (
-                  unmatched, svc, iid, svc, item.get("path", ""), iid))
+            unknown += 1
+            print("          unmatched — couldn't map to an episode; check by hand")
+    if importable:
+        print("  => %d file(s) are content for episodes with NO file — IMPORT them"
+              " (`arr %s import '%s' --series %d --match <token> --map abs`),"
+              " do NOT quarantine" % (importable, svc, item.get("path", ""), iid))
+    if unknown:
+        print("  => %d unmatched file(s): verify what they are (`arr %s parse"
+              " \"<name>\"`) before quarantining" % (unknown, svc))
     movable = un if "--include-versions" in flags else [u for u in un if not u.get("version")]
     if "--quarantine" not in flags:
         if movable:
