@@ -269,34 +269,63 @@ def _ensure_tag(svc, label):
     return api(svc, "POST", "/tag", {"label": label})["id"]
 
 
-def _tag_requester(svc, query, discord_id, remove=False):
+def _stamp_label(svc, item_id, label, remove=False):
+    """Add/remove one tag label on a series/movie via the editor endpoint."""
     if svc.startswith("sonarr"):
         coll, ids_field = "series", "seriesIds"
     elif svc == "radarr":
         coll, ids_field = "movie", "movieIds"
     else:
         die("tag: only sonarr/sonarr-anime/radarr have taggable items")
+    tag_id = _ensure_tag(svc, label)
+    api(svc, "PUT", "/%s/editor" % coll,
+        {ids_field: [item_id], "tags": [tag_id],
+         "applyTags": "remove" if remove else "add"})
+    return coll
+
+
+def _tag_requester(svc, query, discord_id, remove=False):
     did = str(discord_id).strip()
     if not did.isdigit():
         die("tag: --requester must be a numeric Discord user id (got %r)" % discord_id)
     item_id = resolve_id(svc, query)
     # Sonarr/Radarr tag labels allow only [a-z0-9-] (no colon), so `requester-<id>`.
-    tag_id = _ensure_tag(svc, "requester-" + did)
-    api(svc, "PUT", "/%s/editor" % coll,
-        {ids_field: [item_id], "tags": [tag_id],
-         "applyTags": "remove" if remove else "add"})
+    coll = _stamp_label(svc, item_id, "requester-" + did, remove)
     return coll, item_id, did
 
 
+def _require_labels(flags):
+    """['require-subs-eng', ...] from --require-subs/--require-audio flags.
+    The download-notifier reads these at ready-time and appends a verified
+    '🔎 eng subs ✓' line to the ✅ embed — no watcher cron needed."""
+    out = []
+    if flags.get("--require-subs"):
+        out.append("require-subs-" + _norm_lang(flags["--require-subs"]))
+    if flags.get("--require-audio"):
+        out.append("require-audio-" + _norm_lang(flags["--require-audio"]))
+    return out
+
+
 def cmd_tag(svc, args):
-    """arr <svc> tag <id|query> --requester <discordId> [--remove]"""
-    flags, rest = pop_flags(args, {"--requester": 1, "--remove": 0})
-    if not rest or "--requester" not in flags:
-        die("tag: usage: arr <svc> tag <id|query> --requester <discordId> [--remove]")
-    coll, item_id, did = _tag_requester(svc, rest[0], flags["--requester"],
-                                        remove="--remove" in flags)
-    verb = "removed from" if "--remove" in flags else "added to"
-    print("requester:%s %s %s #%d" % (did, verb, coll, item_id))
+    """arr <svc> tag <id|query> [--requester <discordId>]
+        [--require-subs LANG] [--require-audio LANG] [--remove]
+    requester-* routes download-notifier DMs; require-* makes its ✅ ready
+    embed VERIFY the language (ffprobe) — use for "with English subs" asks."""
+    flags, rest = pop_flags(args, {"--requester": 1, "--remove": 0,
+                                   "--require-subs": 1, "--require-audio": 1})
+    req_labels = _require_labels(flags)
+    if not rest or not (flags.get("--requester") or req_labels):
+        die("tag: usage: arr <svc> tag <id|query> [--requester <discordId>]"
+            " [--require-subs LANG] [--require-audio LANG] [--remove]")
+    remove = "--remove" in flags
+    verb = "removed from" if remove else "added to"
+    if flags.get("--requester"):
+        coll, item_id, did = _tag_requester(svc, rest[0], flags["--requester"], remove)
+        print("requester:%s %s %s #%d" % (did, verb, coll, item_id))
+    for lab in req_labels:
+        item_id = resolve_id(svc, rest[0])
+        coll = _stamp_label(svc, item_id, lab, remove)
+        print("%s %s %s #%d (notifier verifies at ready-time)" % (lab, verb, coll, item_id))
 
 
 # --- commands ----------------------------------------------------------------
@@ -1535,7 +1564,8 @@ def cmd_add(svc, args):
         die("add: sonarr/sonarr-anime/radarr only")
     flags, rest = pop_flags(args, {"--tvdb": 1, "--tmdb": 1, "--year": 1,
                                    "--seasons": 1, "--quality": 1, "--root": 1,
-                                   "--no-search": 0, "--requester": 1, "--dry-run": 0})
+                                   "--no-search": 0, "--requester": 1, "--dry-run": 0,
+                                   "--require-subs": 1, "--require-audio": 1})
     if not rest:
         die("add: need a title")
     term = " ".join(rest)
@@ -1554,6 +1584,9 @@ def cmd_add(svc, args):
         if flags.get("--requester"):
             _tag_requester(svc, str(existing["id"]), flags["--requester"])
             print("  tagged requester:%s" % flags["--requester"])
+        for lab in _require_labels(flags):
+            _stamp_label(svc, existing["id"], lab)
+            print("  tagged %s (notifier verifies at ready-time)" % lab)
         if is_series:
             _, rows = _series_coverage(svc, existing["id"])
             fixable, askable = _coverage_print(rows)
@@ -1599,6 +1632,9 @@ def cmd_add(svc, args):
     if flags.get("--requester"):
         _tag_requester(svc, str(created["id"]), flags["--requester"])
         print("  tagged requester:%s (download-notifier will DM them)" % flags["--requester"])
+    for lab in _require_labels(flags):
+        _stamp_label(svc, created["id"], lab)
+        print("  tagged %s (the ✅ ready DM will verify it via ffprobe)" % lab)
 
 
 def cmd_replace(svc, args):
@@ -2964,8 +3000,12 @@ Commands (sonarr & radarr unless noted):
         --wait: block until the triggered command finishes (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
-  tag <id|query> --requester <discordId> [--remove]   (sonarr/radarr)
-        add/remove the requester tag the download-notifier reads (see grab)
+  tag <id|query> [--requester <discordId>] [--require-subs LANG]
+        [--require-audio LANG] [--remove]   (sonarr/radarr)
+        requester-*: download-notifier DMs that person a live progress bar.
+        require-*: the notifier's ✅ ready DM VERIFIES the language via ffprobe
+        ("🔎 eng subs ✓" / "⚠ 1/3") — the fix for "with English subs" asks;
+        no watcher cron needed. add accepts the same --require-* flags.
   episodes <id|query> [--season N] [--missing] [--monitored] [--json]   (sonarr)
         list episodes WITH ids (for grab/import by --episode). --missing = no file
   wait <commandId> [--timeout SECS]   block until a search/grab/import/refresh ends
