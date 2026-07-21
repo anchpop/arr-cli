@@ -1820,33 +1820,110 @@ def _latest_history_date(svc, iid):
     return dates[0] if dates and dates[0] else None
 
 
+WATCH_STATE = os.environ.get(
+    "ARR_WATCH_STATE", os.path.expanduser("~/.local/state/arr-watch.json"))
+
+
+def _watch_state_load():
+    try:
+        with open(WATCH_STATE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _watch_state_save(st):
+    try:
+        os.makedirs(os.path.dirname(WATCH_STATE), exist_ok=True)
+        with open(WATCH_STATE, "w") as fh:
+            json.dump(st, fh)
+    except OSError:
+        pass
+
+
 def cmd_watch(svc, args):
     """One-shot readiness check — THE generic replacement for per-title
-    watch-*.sh watchdog scripts. Run it from a Hermes script-only cron job.
+    watch-*.sh watchdog scripts. Run it from a Hermes script-only cron job;
+    with --once you need NO wrapper script and NO stamp files at all.
 
-    arr <svc> watch <id|query> [--season N] [--until on-disk|in-jellyfin]
-        [--verify-audio LANG] [--verify-subs LANG] [--max-age HOURS] [--quiet]
+    arr <svc> watch <id|query> [<id|query> ...] [--season N]
+        [--until on-disk|in-jellyfin] [--verify-audio LANG] [--verify-subs LANG]
+        [--max-age HOURS] [--quiet] [--once]
 
     With --quiet it prints NOTHING while a download is progressing normally
     (a script-only cron delivers stdout only when non-empty), and reports on
     the state changes that matter:
-      READY    exit 0   done (incl. optional Jellyfin visibility + track checks)
-      pending  exit 1   still downloading / not indexed yet (silent w/ --quiet)
-      STUCK    exit 3   a queue item needs intervention (points at stuck --fix)
-      STALLED  exit 4   nothing queued, gaps remain, no activity in --max-age h"""
+      READY        exit 0   done (incl. optional Jellyfin visibility)
+      pending      exit 1   still downloading / not indexed (silent w/ --quiet)
+      VERIFY-FAIL  exit 2   on disk but --verify-audio/--verify-subs failed
+      STUCK        exit 3   a queue item needs intervention (-> stuck --fix)
+      STALLED      exit 4   nothing queued, gaps remain, idle > --max-age h
+    --once adds cron-friendly memory (state in ~/.local/state/arr-watch.json):
+    READY is announced a single time then stays silent forever; STUCK/STALLED
+    alert once and re-alert only if the item recovers and breaks again; a
+    transient API error is retried once, then treated as silent-pending
+    instead of a false alert. Multiple targets are checked in one call
+    (quote each); exit code is the worst one."""
     if not (svc.startswith("sonarr") or svc == "radarr"):
         die("watch: sonarr/sonarr-anime/radarr only")
     flags, rest = pop_flags(args, {"--season": 1, "--until": 1, "--verify-audio": 1,
-                                   "--verify-subs": 1, "--max-age": 1, "--quiet": 0})
+                                   "--verify-subs": 1, "--max-age": 1, "--quiet": 0,
+                                   "--once": 0})
     if not rest:
         die("watch: need an id or query")
     quiet = "--quiet" in flags
     until = flags.get("--until", "on-disk")
     if until not in ("on-disk", "in-jellyfin"):
         die("watch: --until on-disk|in-jellyfin")
+    ids = [resolve_id(svc, r) for r in rest]  # resolve before --once try/except:
+    # a bad title should die loudly, only downstream API hiccups are transient
+    worst = 0
+    for iid in ids:
+        code = _watch_one(svc, iid, flags, until, quiet)
+        worst = max(worst, code)
+    sys.exit(worst)
+
+
+def _watch_one(svc, iid, flags, until, quiet):
+    once = "--once" in flags
+    key = "%s:%d:%s:%s:%s" % (svc, iid, until, flags.get("--verify-audio", ""),
+                              flags.get("--verify-subs", ""))
+    st = _watch_state_load() if once else {}
+    if once and st.get(key, {}).get("phase") == "ready":
+        return 0  # already announced — stay silent forever
+    for attempt in (1, 2):
+        try:
+            code, out = _watch_check(svc, iid, flags, until, quiet)
+            break
+        except SystemExit:  # api()/jf_api() die()d — transient service blip
+            if attempt == 1:
+                time.sleep(3)
+                continue
+            if once:  # don't false-alert from a cron; try again next firing
+                return 1
+            raise
+    if once:
+        prev = st.get(key, {}).get("phase")
+        if code == 0:
+            st[key] = {"phase": "ready", "ts": int(time.time())}
+            _watch_state_save(st)
+        elif code in (2, 3, 4):
+            if prev == "alert%d" % code:
+                return code  # already alerted for this failure mode — silent
+            st[key] = {"phase": "alert%d" % code, "ts": int(time.time())}
+            _watch_state_save(st)
+        elif prev:  # recovered to pending — re-arm the alert
+            del st[key]
+            _watch_state_save(st)
+    if out:
+        print(out)
+    return code
+
+
+def _watch_check(svc, iid, flags, until, quiet):
+    """Compute one item's watch status; returns (exit_code, text)."""
     season = int(flags["--season"]) if "--season" in flags else None
     is_series = svc.startswith("sonarr")
-    iid = resolve_id(svc, rest[0])
     item = api(svc, "GET", "/%s/%d" % ("series" if is_series else "movie", iid))
     q = _queue_records(svc, page_size=1000)["records"]
     if is_series:
@@ -1855,15 +1932,15 @@ def cmd_watch(svc, args):
         mine = [r for r in q if ((r.get("movie") or {}).get("id") or r.get("movieId")) == iid]
     stuck = [r for r in mine if _is_stuck_queue_record(r)]
     if stuck:
-        print("STUCK: %s — %d queue item(s) need intervention:" % (item["title"], len(stuck)))
+        lines = ["STUCK: %s — %d queue item(s) need intervention:" % (item["title"], len(stuck))]
         for r in stuck:
-            print("  %s/%s  %s" % (r.get("status"), r.get("trackedDownloadState"),
-                                   (r.get("title") or "")[:70]))
+            lines.append("  %s/%s  %s" % (r.get("status"), r.get("trackedDownloadState"),
+                                          (r.get("title") or "")[:70]))
             msgs = _queue_status_messages(r)
             if msgs:
-                print("    " + "; ".join(msgs)[:220])
-        print("  -> arr %s stuck '%s' --fix" % (svc, item["title"]))
-        sys.exit(3)
+                lines.append("    " + "; ".join(msgs)[:220])
+        lines.append("  -> arr %s stuck '%s' --fix" % (svc, item["title"]))
+        return 3, "\n".join(lines)
     if is_series:
         _, rows = _series_coverage(svc, iid, series=item)
         if season is not None:
@@ -1880,31 +1957,28 @@ def cmd_watch(svc, args):
             size = sum(r.get("size") or 0 for r in mine)
             left = sum(r.get("sizeleft") or 0 for r in mine)
             pct = int(100 * (1 - left / size)) if size else 0
-            if not quiet:
-                print("downloading: %s — %d item(s), %d%% (%sMB left)" % (
-                    item["title"], len(mine), pct, mb(left)))
-            sys.exit(1)
+            return 1, "" if quiet else ("downloading: %s — %d item(s), %d%% (%sMB left)" % (
+                item["title"], len(mine), pct, mb(left)))
         if flags.get("--max-age"):
             last = _latest_history_date(svc, iid)
             cutoff = time.strftime("%Y-%m-%dT%H:%M:%S",
                                    time.gmtime(time.time() - float(flags["--max-age"]) * 3600))
             if not last or last[:19] < cutoff:
-                print("STALLED: %s — %s; queue empty, no activity in %sh (last: %s)" % (
-                    item["title"], prog_desc, flags["--max-age"], (last or "never")[:19]))
-                print("  -> re-grab: arr %s grab %d%s" % (
-                    svc, iid, (" --season %d" % season) if season is not None else ""))
-                sys.exit(4)
-        if not quiet:
-            print("pending: %s — %s, nothing in queue" % (item["title"], prog_desc))
-        sys.exit(1)
+                return 4, ("STALLED: %s — %s; queue empty, no activity in %sh (last: %s)\n"
+                           "  -> re-grab: arr %s grab %d%s" % (
+                               item["title"], prog_desc, flags["--max-age"],
+                               (last or "never")[:19], svc, iid,
+                               (" --season %d" % season) if season is not None else ""))
+        return 1, "" if quiet else ("pending: %s — %s, nothing in queue" % (
+            item["title"], prog_desc))
     if until == "in-jellyfin":
         jf = _jf_find_item(item, is_series)
         if not jf:
             jf_api("/Library/Refresh", method="POST", soft=True)  # nudge the scan
-            if not quiet:
-                print("imported: %s — waiting for Jellyfin to index it (refresh nudged)" % item["title"])
-            sys.exit(1)
+            return 1, "" if quiet else (
+                "imported: %s — waiting for Jellyfin to index it (refresh nudged)" % item["title"])
     lines = ["READY: %s (%s)" % (item["title"], item.get("year"))]
+    code = 0
     if flags.get("--verify-audio") or flags.get("--verify-subs"):
         wa = _norm_lang(flags["--verify-audio"]) if flags.get("--verify-audio") else None
         ws = _norm_lang(flags["--verify-subs"]) if flags.get("--verify-subs") else None
@@ -1915,7 +1989,11 @@ def cmd_watch(svc, args):
         if ws:
             lines.append("  subs %s: %d/%d file(s) ok%s" % (
                 ws, n - len(ms), n, ("; MISSING: " + ", ".join(ms[:5])) if ms else ""))
-    print("\n".join(lines))
+        if ma or ms:
+            code = 2
+            lines[0] = ("VERIFY-FAIL: %s (%s) — on disk but the language checks"
+                        " failed:" % (item["title"], item.get("year")))
+    return code, "\n".join(lines)
 
 
 # --- release audio-language heuristics ----------------------------------------
@@ -2848,11 +2926,15 @@ Commands (sonarr & radarr unless noted):
         audio/sub tracks per file via ffprobe + sidecar .srt detection.
         `tracks NANA --missing-audio eng` = which eps lack an English dub;
         '*' marks the default track (catches wrong-default-audio bugs)
-  watch <id|query> [--season N] [--until on-disk|in-jellyfin] [--verify-audio L]
-        [--verify-subs L] [--max-age H] [--quiet]
+  watch <id|query> [more targets...] [--season N] [--until on-disk|in-jellyfin]
+        [--verify-audio L] [--verify-subs L] [--max-age H] [--quiet] [--once]
         one-shot readiness check for cron watchdogs — silent while a download
-        progresses (--quiet), reports READY/STUCK/STALLED. exit: 0 ready,
-        1 pending, 3 stuck, 4 stalled. Replaces per-title watch-*.sh scripts.
+        progresses (--quiet). exit: 0 ready, 1 pending, 2 verify-fail, 3 stuck,
+        4 stalled (multi-target: worst code). --once = announce READY a single
+        time, alert STUCK/STALLED/VERIFY-FAIL once (re-arm on recovery), retry
+        transient API errors instead of false-alerting; state in
+        ~/.local/state/arr-watch.json. Replaces per-title watch-*.sh scripts
+        AND their stamp files — put the bare command in the cron, no wrapper.
   replace <old id|query> <correct title...> [--tmdb ID] [--year Y] [--yes]  (radarr)
         delete wrong movie+file, add the right one, carry requester tag, search.
         dry-run unless --yes (the German-Les-Visiteurs fix)
