@@ -877,10 +877,22 @@ def cmd_queue_rm(svc, args):
     if not go:
         print("  (pass --yes to remove)")
         return
+    failed = 0
     for t in targets:
-        api(svc, "DELETE", "/queue/%d?removeFromClient=%s&blocklist=%s" % (
-            t["id"], rm_client, blocklist))
-        print("  removed: %s" % t["title"][:70])
+        for attempt in (1, 2):
+            try:
+                api(svc, "DELETE", "/queue/%d?removeFromClient=%s&blocklist=%s" % (
+                    t["id"], rm_client, blocklist))
+                print("  removed: %s" % t["title"][:70])
+                break
+            except SystemExit:  # 500 database-locked under load / stale id (404)
+                if attempt == 1:
+                    time.sleep(5)
+                    continue
+                failed += 1
+                print("  FAILED (kept): %s — retry once the arr settles" % t["title"][:70])
+    if failed:
+        sys.exit(1)
 
 
 def cmd_history(svc, args):
@@ -984,7 +996,9 @@ def _episode_number(name):
     base = re.sub(r"\.(mkv|mp4|avi|m4v)$", "", name, flags=re.I)
     base = re.sub(r"\b\d{3,4}p\b", " ", base, flags=re.I)        # 480p/720p/1080p
     base = re.sub(r"\[[0-9A-Fa-f]{6,8}\]", " ", base)            # crc hashes
-    base = re.sub(r"\b(?:x?26[45]|HEVC|AAC|MP3|XviD|FLAC|BD|WEB)\b", " ", base, flags=re.I)
+    # NB: require the x/h codec prefix — a bare \b26[45]\b also matches real
+    # episode numbers (Sgt. Frog abs 264/265 were unmappable until 2026-07-21)
+    base = re.sub(r"\b(?:[xh]\.?26[45]|HEVC|AAC|MP3|XviD|FLAC|BD|WEB)\b", " ", base, flags=re.I)
     m = re.search(r"S(\d{1,2})\s*E(\d{1,3})", base, re.I)
     if m:
         return ("se", int(m.group(1)), int(m.group(2)))
