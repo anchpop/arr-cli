@@ -466,9 +466,14 @@ def cmd_prowlarr_grab(args):
     """arr prowlarr grab <query> [--indexer X] [--group/--match Y] [--cat C]
         [--all] [--dry-run]
     Search across indexers and send the matching release to the right client:
-    usenet -> SABnzbd, torrent -> qBittorrent. Refuses >1 match without --all."""
+    usenet -> SABnzbd, torrent -> qBittorrent. Refuses >1 match without --all.
+    Direct grabs skip the arr's TRaSH-synced profile scoring, so vet the
+    release name yourself (fake upscales like "AI UPSCALE"/bluury-style
+    groups, BR-DISK, LQ groups would all have been auto-rejected)."""
     flags, rest = pop_flags(args, {"--indexer": 1, "--group": 1, "--match": 1,
                                    "--cat": 1, "--limit": 1, "--all": 0, "--dry-run": 0})
+    print("note: direct grabs skip the arr's TRaSH profile scoring — vet the name"
+          " (upscale/LQ/BR-DISK markers) before pushing")
     if not rest:
         die("prowlarr grab: need a search query")
     cat = flags.get("--cat", "sonarr")
@@ -595,6 +600,8 @@ def cmd_grab(svc, args):
         # Fetch candidate usenet releases and hand their NZBs straight to SAB
         # under the service category — bypasses Sonarr's search cache entirely
         # (so it works for releases Sonarr's per-episode search can't see).
+        print("note: --via-sab bypasses the TRaSH-synced profile — its upscale/LQ/"
+              "BR-DISK protection doesn't apply; vet release names yourself")
         rels = api(svc, "GET", "/release?" + _release_query(svc, args), timeout=SEARCH_TIMEOUT)
         seen, n = set(), 0
         for r in rels:
@@ -639,6 +646,8 @@ def cmd_grab(svc, args):
         return
 
     # --override: force-push every candidate release, bypassing rejections
+    print("note: --override ignores every profile rejection (TRaSH scoring incl."
+          " upscale/LQ/BR-DISK protection) — worth a concrete reason")
     rels = api(svc, "GET", "/release?" + _release_query(svc, args), timeout=SEARCH_TIMEOUT)
     seen, count = set(), 0
     for r in rels:
