@@ -516,11 +516,36 @@ def cmd_prowlarr_grab(args):
     print("(%d release(s) grabbed to cat=%s)" % (n, cat))
 
 
+def _promote_downloads(records):
+    """Move fresh grabs to the front of the download clients' queues. An
+    interactive add/grab means a person is waiting — without this, new requests
+    starve behind backlog churn (dead-release grinds hog every connection)."""
+    bumped = 0
+    for r in records:
+        did = r.get("downloadId")
+        if not did:
+            continue
+        try:
+            if r.get("protocol") == "usenet":
+                sab_api("queue", {"name": "priority", "value": did, "value2": "2"})
+                sab_api("switch", {"value": did, "value2": "0"})
+            else:
+                urllib.request.urlopen(urllib.request.Request(
+                    "http://127.0.0.1:%d/api/v2/torrents/topPrio" % QBIT["port"],
+                    data=("hashes=%s" % did.lower()).encode()), timeout=15).read()
+            bumped += 1
+        except Exception:
+            pass  # promotion is best-effort; the download itself is unaffected
+    if bumped:
+        print("  promoted %d download(s) to the front of the queue" % bumped)
+
+
 def _report_first_grab(svc, iid, is_series, timeout=60):
     """Briefly poll the queue after triggering a search, so one command can
     honestly say "downloading <release>" instead of "search started" — this is
     what add/grab callers otherwise reconstruct with status/history/queue
-    follow-ups."""
+    follow-ups. Fresh grabs get promoted to the front of the download queue
+    (an interactive request means someone is waiting on it)."""
     deadline = time.time() + timeout
     while True:
         try:
@@ -538,6 +563,7 @@ def _report_first_grab(svc, iid, is_series, timeout=60):
                 print("    " + (r.get("title") or "?")[:75])
             if len(mine) > 4:
                 print("    ... +%d more" % (len(mine) - 4))
+            _promote_downloads(mine)
             return True
         if time.time() > deadline:
             print("  nothing grabbed in %ds — the search may still be running"
@@ -3006,6 +3032,8 @@ Commands (sonarr & radarr unless noted):
         monitor all regular seasons, library-majority quality profile, search
         immediately, then wait up to 60s and report what got grabbed — one
         command answers "is it downloading?" (--no-wait skips the wait).
+        Fresh grabs are promoted to the front of the download queue (an
+        interactive add means someone is waiting; backlog churn can't starve it).
         --requester wires up the download-notifier DM; --require-* makes the
         notifier's ready DM verify subs/dub languages via ffprobe.
   coverage <id|query> [--fix] [--tracks] [--lang LANG] [--fix-subs] [--dry-run]  (sonarr)
