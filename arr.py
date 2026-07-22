@@ -516,12 +516,45 @@ def cmd_prowlarr_grab(args):
     print("(%d release(s) grabbed to cat=%s)" % (n, cat))
 
 
+def _report_first_grab(svc, iid, is_series, timeout=60):
+    """Briefly poll the queue after triggering a search, so one command can
+    honestly say "downloading <release>" instead of "search started" — this is
+    what add/grab callers otherwise reconstruct with status/history/queue
+    follow-ups."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            q = _queue_records(svc)["records"]
+        except SystemExit:
+            q = []
+        if is_series:
+            mine = [r for r in q if (r.get("seriesId") or (r.get("series") or {}).get("id")) == iid]
+        else:
+            mine = [r for r in q if ((r.get("movie") or {}).get("id") or r.get("movieId")) == iid]
+        if mine:
+            size = sum(r.get("size") or 0 for r in mine)
+            print("  grabbed %d release(s), %sGB — downloading:" % (len(mine), gb(size)))
+            for r in mine[:4]:
+                print("    " + (r.get("title") or "?")[:75])
+            if len(mine) > 4:
+                print("    ... +%d more" % (len(mine) - 4))
+            return True
+        if time.time() > deadline:
+            print("  nothing grabbed in %ds — the search may still be running"
+                  " (indexers can be slow) or releases are scarce. `arr %s queue`"
+                  " shows late grabs; `arr %s releases %s` shows candidates with"
+                  " reject reasons" % (timeout, svc, svc, iid))
+            return False
+        time.sleep(5)
+
+
 def cmd_grab(svc, args):
     if svc == "prowlarr":
         return cmd_prowlarr_grab(args)
     flags, rest = pop_flags(args, {"--season": 1, "--episode": 1,
                                    "--override": 0, "--via-sab": 0, "--dry-run": 0,
-                                   "--wait": 0, "--timeout": 1, "--requester": 1})
+                                   "--wait": 0, "--timeout": 1, "--requester": 1,
+                                   "--no-wait": 0})
     if not rest:
         die("grab: need an id or query")
     override, dry = "--override" in flags, "--dry-run" in flags
@@ -556,24 +589,27 @@ def cmd_grab(svc, args):
 
     if not override:
         # let the arr search & decide (respects the quality profile)
+        iid = resolve_id(svc, rest[0])
         if svc.startswith("sonarr"):
-            sid = resolve_id(svc, rest[0])
             if "--episode" in flags:
                 body = {"name": "EpisodeSearch", "episodeIds": [int(flags["--episode"])]}
             elif "--season" in flags:
-                body = {"name": "SeasonSearch", "seriesId": sid, "seasonNumber": int(flags["--season"])}
+                body = {"name": "SeasonSearch", "seriesId": iid, "seasonNumber": int(flags["--season"])}
             else:
-                body = {"name": "SeriesSearch", "seriesId": sid}
+                body = {"name": "SeriesSearch", "seriesId": iid}
         else:
-            body = {"name": "MoviesSearch", "movieIds": [resolve_id(svc, rest[0])]}
+            body = {"name": "MoviesSearch", "movieIds": [iid]}
         if dry:
             print("DRY: POST /command " + json.dumps(body))
             return
         r = api(svc, "POST", "/command", body)
         print("queued %s (command id %s, status %s)" % (r["commandName"], r["id"], r["status"]))
-        if "--wait" in flags:
+        if "--wait" in flags:  # full search-command completion (bounded by --timeout)
             rec = _wait_command(svc, r["id"], timeout=int(flags.get("--timeout", 300)))
             print("  -> %s %s" % (rec.get("status"), rec.get("message") or ""))
+        if "--no-wait" not in flags:
+            _report_first_grab(svc, iid, svc.startswith("sonarr"),
+                               timeout=int(flags.get("--timeout", 60)))
         return
 
     # --override: force-push every candidate release, bypassing rejections
@@ -1565,7 +1601,8 @@ def cmd_add(svc, args):
     flags, rest = pop_flags(args, {"--tvdb": 1, "--tmdb": 1, "--year": 1,
                                    "--seasons": 1, "--quality": 1, "--root": 1,
                                    "--no-search": 0, "--requester": 1, "--dry-run": 0,
-                                   "--require-subs": 1, "--require-audio": 1})
+                                   "--require-subs": 1, "--require-audio": 1,
+                                   "--no-wait": 0})
     if not rest:
         die("add: need a title")
     term = " ".join(rest)
@@ -1635,6 +1672,11 @@ def cmd_add(svc, args):
     for lab in _require_labels(flags):
         _stamp_label(svc, created["id"], lab)
         print("  tagged %s (the ✅ ready DM will verify it via ffprobe)" % lab)
+    # By default, hang around briefly and report what the search actually
+    # grabbed — so a single `add` answers "is it downloading?" without
+    # status/history/queue follow-up calls.
+    if "--no-search" not in flags and "--no-wait" not in flags:
+        _report_first_grab(svc, created["id"], is_series)
 
 
 def cmd_replace(svc, args):
@@ -2957,12 +2999,15 @@ Commands (sonarr & radarr unless noted):
         so "do we have X?" surfaces partially-downloaded seasons by itself
   add <title> [--year Y] [--tvdb/--tmdb ID] [--seasons all|s1,s2|none]
         [--quality NAME] [--root PATH] [--no-search] [--requester <discordId>]
-        [--dry-run]
+        [--require-subs L] [--require-audio L] [--no-wait] [--dry-run]
         add by title. REFUSES ambiguous matches (lists candidates — narrow by
         --year/--tvdb/--tmdb; the wrong-Gloria guard). If already in the
         library, prints its per-season coverage instead of adding. Defaults:
         monitor all regular seasons, library-majority quality profile, search
-        immediately. --requester wires up the download-notifier DM.
+        immediately, then wait up to 60s and report what got grabbed — one
+        command answers "is it downloading?" (--no-wait skips the wait).
+        --requester wires up the download-notifier DM; --require-* makes the
+        notifier's ready DM verify subs/dub languages via ffprobe.
   coverage <id|query> [--fix] [--tracks] [--lang LANG] [--fix-subs] [--dry-run]  (sonarr)
   coverage --all [--fix] [--quiet] [--limit N]
         per-season gaps vs AIRED episodes. --fix searches missing MONITORED
@@ -2993,11 +3038,14 @@ Commands (sonarr & radarr unless noted):
   releases <id|query> [--season N|--episode EPID] [--audio eng|dual] [--timeout S]
         (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi;
          --timeout: raise past the 300s default — anime searches can exceed it)
-  grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run] [--wait]
-        no flags: search & let the arr decide (respects quality profile)
-        --override: force-push every candidate release (bypass rejections)
-        --via-sab: send candidate NZBs straight to SAB (bypass search cache)
-        --wait: block until the triggered command finishes (--timeout SECS, def 300)
+  grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run]
+        [--wait] [--no-wait]
+        no flags: search & let the arr decide (respects quality profile), then
+        wait up to 60s and report what got grabbed (--no-wait skips; --timeout
+        adjusts). --override: force-push every candidate release (bypass
+        rejections). --via-sab: send candidate NZBs straight to SAB (bypass
+        search cache). --wait: also block until the search command itself
+        finishes (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
   tag <id|query> [--requester <discordId>] [--require-subs LANG]
