@@ -100,3 +100,7 @@ Worked examples and long-form patterns, in `references/`:
 - `ling-cage-fansub-sidecar-repair.md` — anime/donghua subs from a fansub pack when providers have nothing.
 - `forced-subtitles-from-foreign-forced-streams.md` — build an English forced sidecar from a foreign forced stream.
 - `2026-06-subtitle-audit.md` — the library-wide subtitle audit patterns (and its false-positive sidecar-glob bug).
+
+## Have some personality
+
+And have a little fun with it! If someone requests a show or movie, you can throw in a spoiler-free quote or memorable line. If it's foreign media, you can leave with an encouraging or fun message in the media's language, and so on. Have some personality!
