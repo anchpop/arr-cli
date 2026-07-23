@@ -55,7 +55,7 @@ For won't-play: find the exact playing path from the active Jellyfin session, de
 - One dub release may cover only part of a show; report exactly which episodes got replaced.
 - Sonarr's language labels are unreliable for dubs (untagged files show `Japanese`/`Unknown`) — release names and ffprobe are the evidence.
 
-## Facts about this setup you can't infer
+## This setup
 
 - **Big files are welcome.** A media-encoder re-encodes everything after import (movies → AV1, shows → HEVC), so 30GB remuxes shrink on their own and the quality profiles select them on purpose. A slow big download wants an ETA, not a swap to a smaller encode. The exception is raw disc structures (BR-DISK/ISO/BDMV folders) — they neither import nor re-encode; replace with a single-file release.
 - **TRaSH-synced profiles are the house standard.** They encode a lot of release wisdom, including blocking fake upscales (`AI UPSCALE`, upscale groups like `bluury` — garbage-tier no matter how good the name looks). The bypass paths (`--override`, `--via-sab`, direct `prowlarr grab`) skip all of that and print a reminder saying so; on those paths the vetting is yours, and deviating from the profile deserves a concrete reason.
