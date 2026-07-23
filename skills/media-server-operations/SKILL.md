@@ -18,14 +18,14 @@ The local `arr` CLI already knows the service endpoints and API keys here, so it
 
 ## Download Watchers and Notifications
 
-`arr watch --once` has cron memory built in, so a watcher needs no wrapper script or stamp files — the whole job is a bounded cron whose command is the bare CLI call:
+To follow a download until it's watchable, put one `arr watch` command in a script-only cron and let it fire on an interval:
 
 ```sh
 arr radarr watch 'The True Don Quixote' 'The Man Who Killed Don Quixote' \
   --until in-jellyfin --verify-subs eng --max-age 72 --quiet --once
 ```
 
-What `--once` provides (state in `~/.local/state/arr-watch.json`): READY prints exactly once and later firings stay silent; STUCK/STALLED/VERIFY-FAIL alert once and re-arm only if the item recovers and breaks again; transient API errors are retried and then treated as silent-pending rather than becoming false alerts. Multiple titles fit in one call (quote each); the exit code is the worst of them: 0 ready, 1 pending, 2 verify-fail, 3 stuck, 4 stalled. `--verify-audio` / `--verify-subs` run the post-import ffprobe check (embedded + sidecar) themselves, and `--until in-jellyfin` nudges and confirms the Jellyfin scan, so no separate refresh step is needed. Give the cron a bounded repeat count and remove it once READY lands.
+Each run checks the current state and prints only news: nothing while the download progresses normally, one alert if it gets stuck/stalled/fails verification, one READY line when it's done — and nothing on any run after that. `--once` is what keeps the repeats quiet: the command remembers what it has already announced (state in `~/.local/state/arr-watch.json`), so no wrapper script or stamp files are needed, and an already-sent alert only repeats if the item recovers and then breaks again. Transient API errors are retried, then treated as still-pending rather than alerted. Several titles fit in one command (quote each); the exit code is the worst state across them: 0 ready, 1 pending, 2 verify-fail, 3 stuck, 4 stalled. `--verify-audio` / `--verify-subs` ffprobe the imported files (embedded streams + sidecars); `--until in-jellyfin` nudges the Jellyfin scan and confirms visibility. Give the cron a bounded repeat count and remove it once READY lands.
 
 Worth choosing the notification channel thoughtfully, because cron output arrives in chat wrapped in `Cronjob Response: … job_id …` boilerplate that reads as spam when repeated — while the download-notifier speaks through a single polished embed it keeps editing:
 
