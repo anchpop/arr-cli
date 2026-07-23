@@ -18,7 +18,7 @@ Use this skill for hands-on administration of the media server stack: Sonarr/Rad
 
 The local `arr` CLI already knows the service endpoints and API keys here, so it's the natural first tool for Sonarr/Radarr/SABnzbd work. Direct REST calls are there for when the CLI output is too summarized or missing a diagnostic field.
 
-When an automation starts needing non-trivial Sonarr/Radarr/SAB/qBittorrent logic, the best home for that logic is the `arr` CLI itself — knowledge that lands there stays reusable, whereas one-off cron scripts tend to rot. (This skill lives in the same repo as the CLI, `/data/arr` — when a tool change makes part of this document stale, update both in the same commit.)
+When an automation starts needing non-trivial Sonarr/Radarr/SAB/qBittorrent logic, the best home for that logic is the `arr` CLI itself — knowledge that lands there stays reusable, whereas one-off cron scripts tend to rot. (Repo conventions and the map of the wider machinery live in `DEVELOPMENT.md` at the repo root.)
 
 ## When to Use
 
@@ -39,7 +39,7 @@ arr radarr watch 'The True Don Quixote' 'The Man Who Killed Don Quixote' \
   --until in-jellyfin --verify-subs eng --max-age 72 --quiet --once
 ```
 
-What `--once` provides (state in `~/.local/state/arr-watch.json`): READY prints exactly once and later firings stay silent; STUCK/STALLED/VERIFY-FAIL alert once and re-arm only if the item recovers and breaks again; transient API errors are retried and then treated as silent-pending rather than becoming false alerts. Multiple titles fit in one call (quote each); the exit code is the worst of them: 0 ready, 1 pending, 2 verify-fail, 3 stuck, 4 stalled. `--verify-audio` / `--verify-subs` run the post-import ffprobe check (embedded + sidecar) themselves, and `--until in-jellyfin` nudges and confirms the Jellyfin scan, so no separate refresh step is needed. Give the cron a bounded repeat count and remove it once READY lands. Older `references/*watch*.md` files describing bespoke scripts with stamp files predate `--once`.
+What `--once` provides (state in `~/.local/state/arr-watch.json`): READY prints exactly once and later firings stay silent; STUCK/STALLED/VERIFY-FAIL alert once and re-arm only if the item recovers and breaks again; transient API errors are retried and then treated as silent-pending rather than becoming false alerts. Multiple titles fit in one call (quote each); the exit code is the worst of them: 0 ready, 1 pending, 2 verify-fail, 3 stuck, 4 stalled. `--verify-audio` / `--verify-subs` run the post-import ffprobe check (embedded + sidecar) themselves, and `--until in-jellyfin` nudges and confirms the Jellyfin scan, so no separate refresh step is needed. Give the cron a bounded repeat count and remove it once READY lands.
 
 Worth choosing the notification channel thoughtfully, because cron output arrives in chat wrapped in `Cronjob Response: … job_id …` boilerplate that reads as spam when repeated — while the download-notifier speaks through a single polished embed it keeps editing:
 
@@ -310,9 +310,9 @@ For obscure/localized films, retry with `-n` using original and English titles. 
 
 ## Targeting Anime Dubs / Audio-Language Variants
 
-Since 2026-07-22 the anime profile scores `Anime Dual Audio` at +101 (above the release-group tiers) and carries the TRaSH Unwanted formats (Upscaled, LQ, BR-DISK…), so a plain `arr sonarr-anime grab` now prefers dual-audio copies and avoids garbage by itself — start there, and reach for manual targeting only when the profile search comes up empty.
+The anime profile scores `Anime Dual Audio` at +101 (above the release-group tiers) and carries the TRaSH Unwanted formats (Upscaled, LQ, BR-DISK…), so a plain `arr sonarr-anime grab` now prefers dual-audio copies and avoids garbage by itself — start there, and reach for manual targeting only when the profile search comes up empty.
 
-The TRaSH-synced profiles are the house standard: they encode a lot of accumulated release wisdom, so deviating from them (`--override`, `--via-sab`, direct `prowlarr grab`) deserves a concrete reason — usually "the profile found nothing and the user wants a copy anyway." On those manual paths the profile's protection doesn't apply, so vet release names yourself: fake upscales (`AI UPSCALE`, upscale groups like `bluury`) are garbage-tier no matter how appealing "Dual Audio 1080p HEVC" looks in the listing — one such pack ground SAB post-processing for a day — and BR-DISK/LQ-group markers are equally disqualifying.
+The TRaSH-synced profiles are the house standard: they encode a lot of accumulated release wisdom, so deviating from them (`--override`, `--via-sab`, direct `prowlarr grab`) deserves a concrete reason — usually "the profile found nothing and the user wants a copy anyway." On those manual paths the profile's protection doesn't apply, so vet release names yourself: fake upscales (`AI UPSCALE`, upscale groups like `bluury`) are garbage-tier no matter how appealing "Dual Audio 1080p HEVC" looks in the listing — one such pack once ground SAB post-processing for a day — and BR-DISK/LQ-group markers are equally disqualifying.
 
 A specific-dub request is a best-effort release-targeting task: Sonarr tracks language metadata, but "dub" lives in release titles.
 
@@ -349,7 +349,7 @@ The policy boundary: if metadata or context shows the link is unofficial third-p
 
 Large BluRay rips and remuxes are good grabs here. The box runs an automatic media-encoder that re-encodes after import (movies → AV1 with film-grain synthesis, shows → HEVC), so a 30GB remux shrinks substantially on its own — and the high-quality source gives the encoder its best input. The quality profiles (TRaSH: UHD Bluray + WEB, Remux-1080p for anime) select for these on purpose, so a big grab is usually the profile working as intended. When someone's waiting on a slow large download, an ETA usually serves them better than a swap to a smaller release.
 
-The exception is raw disc structures (`BR-DISK`, `COMPLETE BLURAY`, ISO/BDMV/VIDEO_TS folders): they don't auto-import and the encoder skips disc folders, so they're worth replacing with a single-file release — a remux is ideal. `references/radarr-anime-movie-brdisk-avoidance.md` predates the encoder; its size-avoidance advice really only applies to disc structures.
+The exception is raw disc structures (`BR-DISK`, `COMPLETE BLURAY`, ISO/BDMV/VIDEO_TS folders): they don't auto-import and the encoder skips disc folders, so they're worth replacing with a single-file release — a remux is ideal.
 
 For a disc-structure queue item: remove and usually blocklist that specific item, then pick a single-file release with a restrictive Prowlarr dry run. Watch for duplicate mirrors and stale qBittorrent rows when replacing something SAB/Radarr already had active.
 
@@ -492,7 +492,6 @@ Watch-history / cleanup reports deserve extra care: a missing Jellyfin `UserData
 - `references/sonarr-anime-alt-title-import-blocked.md` — staged imports for alternate/localized-title blocks.
 - `references/jellyfin-playback-corrupt-episode-replacement.md` — decode-test and replace a failing episode.
 - `references/jellyfin-audio-language-default-repair.md` — wrong-default-audio repair via disposition-only remux.
-- `references/jellyfin-unmanaged-duplicate-episodes.md` — unmanaged-duplicate diagnosis (automated by `arr audit`).
 
 ## Verification Checklist
 
