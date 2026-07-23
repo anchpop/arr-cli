@@ -1,7 +1,7 @@
 ---
 name: requested-show-coverage-policy
 description: Use when handling requests to add, get, or verify TV shows in Sonarr/Sonarr Anime; covers per-season coverage checks, proactive dub/sub + duplicate-file reporting, fixing partial monitored seasons, and asking before grabbing whole missing/unmonitored seasons.
-version: 2.0.0
+version: 2.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -12,15 +12,7 @@ metadata:
 
 # Requested Show Coverage Policy
 
-## Overview
-
-Use this alongside `media-server-operations` for requests like "add this show," "get this show," or "make sure we have this." The guiding idea: the first reply should cover the show's whole health — coverage, dub/sub state, library cleanliness — so the user doesn't have to come back with "subs and dubs?" or "the first episode is wrong."
-
-## When to Use
-
-- A user asks to add/get/request/check a TV show.
-- A requested show is already in Sonarr/Sonarr Anime.
-- A multi-title request mixes new shows with shows already present.
+Use alongside `media-server-operations` for requests like "add this show," "get this show," or "make sure we have this" — including shows already present, and multi-title requests mixing new and existing. The guiding idea: the first reply should cover the show's whole health — coverage, dub/sub state, library cleanliness — so the user doesn't have to come back with "subs and dubs?" or "the first episode is wrong."
 
 ## Workflow for a Requested Show
 

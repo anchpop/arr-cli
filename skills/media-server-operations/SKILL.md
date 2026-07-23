@@ -1,7 +1,7 @@
 ---
 name: media-server-operations
-description: "Use when administering a Sonarr/Radarr/SABnzbd/Jellyfin-style media server: investigating missing requests, stuck imports, download queues, library scans, and safe media-library fixes."
-version: 2.1.0
+description: "Use when administering the Sonarr/Radarr/SABnzbd/qBittorrent/Jellyfin media stack: missing or stuck requests, failed downloads, import blocks, duplicate/wrong episodes, release selection, library scans and safe library fixes — including when woken by the queue-stuck / download-failed / language-gap webhooks. Not for media generation (music/image/video creation)."
+version: 2.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -12,23 +12,9 @@ metadata:
 
 # Media Server Operations
 
-## Overview
+Hands-on administration of the media stack, especially when a requested title didn't appear in the library. The goal is to answer with verified operational state and, when safe, fix the issue rather than just explain it — distinguishing not-found, failed download, still downloading, import blocked, permissions, wrong match, and scan delay, since each has a different fix.
 
-Use this skill for hands-on administration of the media server stack: Sonarr/Radarr/Prowlarr/SABnzbd/qBittorrent/Jellyfin, especially when a requested title didn't appear in the library. The goal is to answer with verified operational state and, when safe, fix the issue rather than just explain it.
-
-The local `arr` CLI already knows the service endpoints and API keys here, so it's the natural first tool for Sonarr/Radarr/SABnzbd work. Direct REST calls are there for when the CLI output is too summarized or missing a diagnostic field.
-
-When an automation starts needing non-trivial Sonarr/Radarr/SAB/qBittorrent logic, the best home for that logic is the `arr` CLI itself — knowledge that lands there stays reusable, whereas one-off cron scripts tend to rot. (Repo conventions and the map of the wider machinery live in `DEVELOPMENT.md` at the repo root.)
-
-## When to Use
-
-- A user asks why a requested movie/show didn't download or appear in Jellyfin.
-- Sonarr/Radarr shows completed downloads stuck in queue or import blocked.
-- SABnzbd/qBittorrent completed an item but the library still reports 0 files on disk.
-- You need to inspect or manually import files from completed downloads into `/data/media`.
-- You need to distinguish: not found, failed download, still downloading, import blocked, permissions issue, wrong series/movie match, or library scan delay.
-
-Media *generation* (music/image/video creation) has its own skills.
+The local `arr` CLI already knows the service endpoints and API keys here, so it's the natural first tool; direct REST calls are for when its output is too summarized or missing a diagnostic field. When an automation starts needing non-trivial arr logic, the best home for that logic is the CLI itself — knowledge that lands there stays reusable, whereas one-off cron scripts tend to rot. (Repo conventions and the map of the wider machinery live in `DEVELOPMENT.md` at the repo root.)
 
 ## Download Watchers and Notifications
 

@@ -1,18 +1,11 @@
 ---
 name: media-subtitle-maintenance
-description: Audit and repair English subtitle availability across Jellyfin/Sonarr/Radarr media libraries, including foreign-audio titles, anime, series, and optional all-title subtitle passes.
+description: Audit and repair English subtitle availability in Jellyfin — "add English subs for X", "why doesn't this title show subtitles", foreign-audio and anime titles, library-wide subtitle passes. Bazarr-first for downloads; ffprobe/filesystem for verification.
 ---
 
 # Media Subtitle Maintenance
 
-Use this for requests like:
-
-- “Add English subtitles for these movies/series.”
-- “Scan all foreign titles and make sure they have English subtitles.”
-- “Run the subtitle pass again, including English-audio titles.”
-- “Why did Jellyfin not show subtitles for this title?”
-
-This skill covers Jellyfin-side subtitle availability via sidecar or embedded English subtitle tracks. Prefer local verification with `ffprobe`/filesystem checks over assumptions from Radarr/Sonarr metadata alone.
+Subtitle availability is a property of the actual files — sidecar `.srt`/`.ass` next to the video, or embedded subtitle streams — so verify with `ffprobe`/filesystem checks rather than trusting Radarr/Sonarr metadata, and claim a fix only after the files show it.
 
 ## Core workflow
 
