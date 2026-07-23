@@ -1,7 +1,7 @@
 ---
 name: media-server-operations
-description: "Use when administering the Sonarr/Radarr/SABnzbd/qBittorrent/Jellyfin media stack: missing or stuck requests, failed downloads, import blocks, duplicate/wrong episodes, release selection, library scans and safe library fixes — including when woken by the queue-stuck / download-failed / language-gap webhooks. Not for media generation (music/image/video creation)."
-version: 3.0.0
+description: "Use when administering the Sonarr/Radarr/SABnzbd/qBittorrent/Jellyfin media stack: media requests, missing or stuck downloads, failed downloads, import blocks, duplicate/wrong episodes, subtitle and dub gaps or backfills, Seerr request repair, release selection, library scans and safe library fixes — including when woken by the queue-stuck / download-failed / language-gap webhooks. Not for media generation (music/image/video creation)."
+version: 3.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -33,7 +33,7 @@ Look before fixing: `arr <svc> stuck` — items that recovered or are progressin
 `arr <svc> audit '<show>'` compares the disk against the arr's records and gives a per-file verdict: DUPLICATE → `--quarantine --yes` moves it (plus sidecar subs) to `/data/hermes/quarantine/`, rescans the arr, refreshes Jellyfin — nothing is deleted, restoring is moving it back; UNIMPORTED → that's missing content, import it rather than quarantine; JELLYFIN VERSION (`Title (Year) - Label.mkv`) → intentional multi-version naming, leave it. One glance before quarantining a dup: if it's dual-audio and the tracked file isn't, the "duplicate" may be the better file — surface that instead.
 
 **Subtitles or dubs missing.**
-`arr <svc> coverage '<show>' --tracks` reads the actual files (embedded streams + sidecars) per season. On main sonarr and radarr, Bazarr fetches missing subs (`--fix-subs`, or `arr bazarr search --series/--movie`); check `arr bazarr status` when nothing arrives — a throttled/expired provider is the usual cause. The anime instance is not Bazarr-covered: missing subs or dubs there mean finding a dual-audio or subbed release, though the anime profile already prefers dual-audio so a plain re-grab often does it. Missing audio is never fetchable as a file — it always means a different release.
+`arr <svc> coverage '<show>' --tracks` reads the actual files (embedded streams + sidecars) per season. On main sonarr and radarr, Bazarr fetches missing subs (`--fix-subs`, or `arr bazarr search --series/--movie`); check `arr bazarr status` when nothing arrives — a throttled/expired provider is the usual cause. The anime instance is not Bazarr-covered: missing subs or dubs there mean finding a dual-audio or subbed release, though the anime profile already prefers dual-audio so a plain re-grab often does it. Missing audio is never fetchable as a file — it always means a different release. When every provider strikes out, the last resorts are fansub subtitle packs and per-file `subliminal` runs — worked examples in the subtitle references.
 
 **Follow up on a download nobody is tagged on.**
 Requester-tagged downloads need nothing — the notifier handles progress, ready, and verification. For the rest, one `arr <svc> watch '<title>' [--until in-jellyfin] [--verify-subs eng] --quiet --once` in a bounded cron: each firing prints only news — one alert if it gets stuck/stalled/fails verification, one READY when done, silence otherwise (`--once` makes it remember what it already announced, so repeats stay quiet; an alert re-arms if the item recovers and breaks again). Remove the cron once READY lands.
@@ -96,3 +96,7 @@ Worked examples and long-form patterns, in `references/`:
 - `transferit-mega-metadata-probe.md` — metadata-only triage for share links.
 - `jellyfin-letterboxd-plugin-v01.md`, `jellyfin-letterboxd-backfill.md`, `letterboxd-export-followup-and-import.md`, `letterboxd-jellyfin-recommend-and-request.md` — Letterboxd plugin operations.
 - `seerr-unfulfilled-request-audit.md`, `seerr-unfulfilled-easy-fixes-and-radarr-manual-import.md` — website-request audits and their fixes.
+- `sonarr-seerr-manual-import-patterns.md`, `seerr-request-scope-and-batch-repair.md` — Seerr per-season status nuances and batch repair examples.
+- `ling-cage-fansub-sidecar-repair.md` — anime/donghua subs from a fansub pack when providers have nothing.
+- `forced-subtitles-from-foreign-forced-streams.md` — build an English forced sidecar from a foreign forced stream.
+- `2026-06-subtitle-audit.md` — the library-wide subtitle audit patterns (and its false-positive sidecar-glob bug).
