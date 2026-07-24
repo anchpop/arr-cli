@@ -2528,31 +2528,57 @@ def cmd_audit(svc, args):
               " `arr jellyfin refresh`)")
 
 
+def _resolve_soft(svc, q):
+    """Like resolve_id but never exits — returns (id, None) or (None, reason).
+    Prefers an exact title match when a substring is ambiguous. For batch delete,
+    where one bad title in a list shouldn't abort the whole run."""
+    if str(q).isdigit():
+        return int(q), None
+    coll = "series" if svc.startswith("sonarr") else "movie"
+    ql = q.lower()
+    hits = []
+    for it in api(svc, "GET", "/" + coll):
+        names = [it.get("title", ""), it.get("titleSlug", "")]
+        names += [a.get("title", "") for a in (it.get("alternateTitles") or [])]
+        if any(ql in (n or "").lower() for n in names):
+            hits.append(it)
+    if not hits:
+        return None, 'no match for "%s"' % q
+    if len(hits) > 1:
+        exact = [h for h in hits if (h.get("title", "") or "").lower() == ql]
+        if len(exact) == 1:
+            return exact[0]["id"], None
+        cands = ", ".join("%s (%s) [%d]" % (h["title"], h.get("year"), h["id"]) for h in hits[:6])
+        return None, 'ambiguous "%s" — %d matches: %s' % (q, len(hits), cands)
+    return hits[0]["id"], None
+
+
 def cmd_delete(svc, args):
     """Delete media via the arr API (deletes as the service user — no rm/perms
     fight — and updates the DB so it won't silently re-download). Dry-run unless
-    --yes. sonarr: --seasons X-Y (+ unmonitor) | --all. radarr: --file-only | (default whole movie)."""
+    --yes. Accepts MANY titles/ids at once. Also cancels each item's active
+    downloads (removeFromClient) by default, so "delete X" fully stops wanting it
+    — pass --keep-downloads to leave the queue alone, --blocklist to blocklist the
+    cancelled releases. sonarr: --seasons X-Y (+ unmonitor) | --all (whole series).
+    radarr: --file-only (keep entry, drop file) | default whole movie."""
     flags, rest = pop_flags(args, {"--seasons": 1, "--all": 0, "--file-only": 0,
-                                   "--keep-monitored": 0, "--yes": 0})
+                                   "--keep-monitored": 0, "--keep-downloads": 0,
+                                   "--blocklist": 0, "--yes": 0})
     if not rest:
         die("delete: need an id or query")
     go = "--yes" in flags
     tag = "" if go else "[dry-run] "
-    if svc.startswith("sonarr"):
+    cancel = "--keep-downloads" not in flags
+    blocklist = "true" if "--blocklist" in flags else "false"
+    is_sonarr = svc.startswith("sonarr")
+
+    # --- surgical single-item modes: --seasons (sonarr) / --file-only (radarr) ---
+    if is_sonarr and "--seasons" in flags:
+        if len(rest) != 1:
+            die("delete --seasons: one show at a time")
         sid = resolve_id(svc, rest[0])
         s = api(svc, "GET", "/series/%d" % sid)
         allfiles = api(svc, "GET", "/episodefile?seriesId=%d" % sid) or []
-        if "--all" in flags:
-            print("%sDELETE SERIES '%s' + %d file(s) (%sGB)" % (
-                tag, s["title"], len(allfiles), gb(sum(f.get("size", 0) for f in allfiles))))
-            if not go:
-                print("  (pass --yes to delete)")
-                return
-            api(svc, "DELETE", "/series/%d?deleteFiles=true" % sid)
-            print("deleted series + files")
-            return
-        if "--seasons" not in flags:
-            die("sonarr delete: need --seasons X-Y or --all")
         want = _parse_seasons(flags["--seasons"])
         files = [f for f in allfiles if f["seasonNumber"] in want]
         unmon = "--keep-monitored" not in flags
@@ -2574,26 +2600,116 @@ def cmd_delete(svc, args):
                     se["monitored"] = False
             api(svc, "PUT", "/series/%d" % sid, s)
         print("deleted %d file(s)%s" % (len(ids), " + unmonitored" if unmon else ""))
-    else:
+        return
+    if not is_sonarr and "--file-only" in flags:
+        if len(rest) != 1:
+            die("delete --file-only: one movie at a time")
         mid = resolve_id("radarr", rest[0])
         m = api("radarr", "GET", "/movie/%d" % mid)
-        if "--file-only" in flags:
-            files = api("radarr", "GET", "/moviefile?movieId=%d" % mid) or []
-            print("%s'%s': delete file only (%d, %sGB) — keeps movie for re-grab" % (
-                tag, m["title"], len(files), gb(sum(f.get("size", 0) for f in files))))
-            if not go:
-                print("  (pass --yes to delete)")
-                return
-            for f in files:
-                api("radarr", "DELETE", "/moviefile/%d" % f["id"])
-            print("deleted %d file(s)" % len(files))
-            return
-        print("%sDELETE MOVIE '%s' + file (%sGB)" % (tag, m["title"], gb(m.get("sizeOnDisk"))))
+        files = api("radarr", "GET", "/moviefile?movieId=%d" % mid) or []
+        print("%s'%s': delete file only (%d, %sGB) — keeps movie for re-grab" % (
+            tag, m["title"], len(files), gb(sum(f.get("size", 0) for f in files))))
         if not go:
             print("  (pass --yes to delete)")
             return
-        api("radarr", "DELETE", "/movie/%d?deleteFiles=true" % mid)
-        print("deleted movie + file")
+        for f in files:
+            api("radarr", "DELETE", "/moviefile/%d" % f["id"])
+        print("deleted %d file(s)" % len(files))
+        return
+
+    # --- whole-item delete (one or many) ---
+    if is_sonarr and "--all" not in flags:
+        die("sonarr delete: pass --seasons X-Y (surgical) or --all (whole series)")
+    coll = "series" if is_sonarr else "movie"
+    key = "seriesId" if is_sonarr else "movieId"
+    # Fetch the queue once and index by item id, so a big batch doesn't re-pull it.
+    by_item = {}
+    if cancel:
+        for r in _queue_records(svc, page_size=2000)["records"]:
+            by_item.setdefault(r.get(key), []).append(r)
+
+    ok = 0
+    for q in rest:
+        iid, err = _resolve_soft(svc, q)
+        if iid is None:
+            print("  ! %s — %s" % (q, err))
+            continue
+        item = api(svc, "GET", "/%s/%d" % (coll, iid))
+        if is_sonarr:
+            files = api(svc, "GET", "/episodefile?seriesId=%d" % iid) or []
+            what = "SERIES '%s' + %d file(s) (%sGB)" % (
+                item["title"], len(files), gb(sum(f.get("size", 0) for f in files)))
+        else:
+            what = "MOVIE '%s' + file (%sGB)" % (item["title"], gb(item.get("sizeOnDisk")))
+        dls = by_item.get(iid, [])
+        extra = (" + cancel %d download(s)" % len(dls)) if dls else ""
+        print("%sDELETE %s%s" % (tag, what, extra))
+        if not go:
+            continue
+        for r in dls:  # stop the client download first, while movieId still maps
+            try:
+                api(svc, "DELETE", "/queue/%d?removeFromClient=true&blocklist=%s" % (r["id"], blocklist))
+            except SystemExit:
+                pass  # record already gone — fine
+        api(svc, "DELETE", "/%s/%d?deleteFiles=true" % (coll, iid))
+        note = " (cancelled %d download%s)" % (len(dls), "" if len(dls) == 1 else "s") if dls else ""
+        print("    deleted%s" % note)
+        ok += 1
+    if not go:
+        print("  (pass --yes to delete)")
+    else:
+        print("done: %d/%d deleted" % (ok, len(rest)))
+
+
+def cmd_delete_auto(args):
+    """Top-level `arr delete <title|id> ... [--yes] [--keep-downloads]
+    [--blocklist]` — no service needed. Works out per title whether it's a movie
+    (Radarr) or a show (Sonarr/Sonarr-anime), cancels its active downloads, and
+    removes it. Mixed movie/show lists are fine. Dry-run unless --yes."""
+    flags, rest = pop_flags(args, {"--keep-downloads": 0, "--blocklist": 0, "--yes": 0})
+    if not rest:
+        die("delete: need one or more titles/ids")
+    passthru = [f for f in ("--keep-downloads", "--blocklist", "--yes") if f in flags]
+    libs = {}  # svc -> library list, fetched once each
+
+    def matches_in(svc, q):
+        if svc not in libs:
+            coll = "series" if svc.startswith("sonarr") else "movie"
+            libs[svc] = api(svc, "GET", "/" + coll)
+        if str(q).isdigit():
+            return [it for it in libs[svc] if it["id"] == int(q)]
+        ql = q.lower()
+        hits = []
+        for it in libs[svc]:
+            names = [it.get("title", ""), it.get("titleSlug", "")]
+            names += [a.get("title", "") for a in (it.get("alternateTitles") or [])]
+            if any(ql in (n or "").lower() for n in names):
+                hits.append(it)
+        exact = [h for h in hits if (h.get("title", "") or "").lower() == ql]
+        return exact if len(exact) == 1 else hits
+
+    groups = {}
+    for q in rest:
+        found = [(svc, h) for svc in ("radarr", "sonarr", "sonarr-anime")
+                 for h in matches_in(svc, q)]
+        if not found:
+            print('  ! %s — no movie or show matches' % q)
+            continue
+        if len(found) > 1:
+            where = ", ".join("%s:%s (%s) [%d]" % (s, h["title"], h.get("year"), h["id"])
+                              for s, h in found[:6])
+            print('  ! %s — matches %d items (%s); delete via `arr <svc> delete <id>`'
+                  % (q, len(found), where))
+            continue
+        svc, h = found[0]
+        groups.setdefault(svc, []).append(str(h["id"]))
+
+    for svc in ("radarr", "sonarr", "sonarr-anime"):
+        ids = groups.get(svc)
+        if not ids:
+            continue
+        extra = ["--all"] if svc.startswith("sonarr") else []
+        cmd_delete(svc, ids + extra + passthru)
 
 
 def cmd_jf_unwatched(args):
@@ -3108,8 +3224,18 @@ Commands (sonarr & radarr unless noted):
         status/coverage/add warn about these automatically for single items;
         --all sweeps the whole library (exit 1 if offenders found — cron it).
   delete <id|query> ...           DELETE via API (dry-run unless --yes):
-        sonarr: --seasons X-Y [--keep-monitored] | --all
+        takes MANY titles/ids at once and also cancels each item's active
+        downloads (removeFromClient), so "delete X Y Z" fully stops wanting them.
+        --keep-downloads leaves the queue alone; --blocklist blocklists the
+        cancelled releases.
+        sonarr: --seasons X-Y [--keep-monitored] (surgical) | --all (whole series)
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
+
+Top-level (no service):
+  delete <title|id> ... [--yes] [--keep-downloads] [--blocklist]
+        works out per title whether it's a movie or a show, then removes it and
+        cancels its downloads. Mixed movie/show lists are fine — the one-liner
+        for "get rid of these" without naming radarr/sonarr each time.
   parse "<release title>"         show how the arr maps a title (series+episode)
   import <folder> --series <id|query> [--match SUBSTR] [--season N]
         [--map auto|abs|se] [--mode copy|move] [--batch N] [--dry-run] [--wait]  (sonarr)
@@ -3194,6 +3320,9 @@ def main(argv):
         if not fn:
             die("unknown bazarr command '%s'" % argv[1])
         fn(argv[2:])
+        return
+    if svc == "delete":
+        cmd_delete_auto(argv[1:])
         return
     if svc not in SERVICES:
         die("unknown service '%s' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr)" % svc)
