@@ -736,12 +736,19 @@ def _queue_record_summary(r):
 
 
 def cmd_queue(svc, args):
-    pat = args[0].lower() if args else None
-    q = _queue_records(svc, page_size=200)
-    print("queue: %d item(s)%s" % (q["totalRecords"], (" matching '%s'" % args[0]) if pat else ""))
-    for r in q["records"]:
-        if pat and pat not in (r.get("title", "").lower()):
-            continue
+    """List queue items. Filter with a title substring or --disc/--quality NAME/
+    --status STATE; --ids prints just the queue ids (pipe into queue-rm)."""
+    flags, rest = pop_flags(args, {"--disc": 0, "--quality": 1, "--status": 1,
+                                   "--title": 1, "--ids": 0})
+    q = _queue_records(svc, page_size=1000)
+    sel = _queue_select(q["records"], flags, rest)
+    if "--ids" in flags:
+        for r in sel:
+            print(r["id"])
+        return
+    filt = "" if len(sel) == q["totalRecords"] else " (of %d)" % q["totalRecords"]
+    print("queue: %d item(s)%s" % (len(sel), filt))
+    for r in sel:
         print("  %s/%s  %sMB left  %s" % (
             r.get("status"), r.get("trackedDownloadState"), mb(r.get("sizeleft")), r.get("title")))
         if r.get("errorMessage"):
@@ -951,39 +958,56 @@ def cmd_episodes(svc, args):
 def cmd_queue_rm(svc, args):
     """Remove queue record(s) by id or title pattern — the API way, no raw curl.
 
-    arr <svc> queue-rm <id|pattern> [--blocklist] [--keep-files] [--yes]
-    Default also removes the download from the client (removeFromClient=true);
-    --keep-files leaves it. --blocklist makes the arr avoid re-grabbing the same
-    release. Dry-run unless --yes. Pairs with `stuck` for clearing dead items."""
-    flags, rest = pop_flags(args, {"--blocklist": 0, "--keep-files": 0, "--yes": 0})
-    if not rest:
-        die("queue-rm: need a queue id or title pattern")
-    if rest[0].isdigit():
-        targets = [{"id": int(rest[0]), "title": "(queue id %s)" % rest[0]}]
+    arr <svc> queue-rm <id…|pattern> [--disc|--quality NAME|--status STATE]
+        [--blocklist] [--keep-files] [--research] [--yes]
+    Selects by queue id(s), a title substring, or a selector shared with `queue`
+    (--disc = raw-disc BR-DISK/ISO, --quality NAME, --status failed|stuck|…).
+    Default removes the download from the client (removeFromClient=true);
+    --keep-files leaves it; --blocklist avoids re-grabbing the same release;
+    --research re-searches the affected movies/shows for a replacement. Dry-run
+    unless --yes. So a raw-disc sweep is:
+        arr radarr queue-rm --disc --blocklist --research --yes"""
+    flags, rest = pop_flags(args, {"--blocklist": 0, "--keep-files": 0, "--yes": 0,
+                                   "--disc": 0, "--quality": 1, "--status": 1,
+                                   "--title": 1, "--research": 0})
+    idkey = "seriesId" if svc.startswith("sonarr") else "movieId"
+    selectors = ("--disc" in flags or flags.get("--quality") or flags.get("--status")
+                 or flags.get("--title"))
+    numeric_only = rest and all(str(x).isdigit() for x in rest)
+    if not rest and not selectors:
+        die("queue-rm: need a queue id, title pattern, or selector (--disc/--quality/--status)")
+    # Light path: bare ids, no selector, no re-search — no need to pull the queue.
+    if numeric_only and not selectors and "--research" not in flags:
+        targets = [{"id": int(x), "title": "(queue id %s)" % x, idkey: None} for x in rest]
     else:
-        pat = rest[0].lower()
-        q = _queue_records(svc, page_size=1000)
-        targets = [{"id": r["id"], "title": r.get("title", "")}
-                   for r in q["records"] if pat in (r.get("title", "").lower())]
-        if not targets:
-            die("queue-rm: no queue items matching '%s'" % rest[0])
+        recs = _queue_records(svc, page_size=1000)["records"]
+        sel = _queue_select(recs, flags, rest)
+        if not sel:
+            die("queue-rm: nothing matched")
+        targets = [{"id": r["id"], "title": r.get("title", ""), idkey: r.get(idkey)} for r in sel]
     rm_client = "false" if "--keep-files" in flags else "true"
     blocklist = "true" if "--blocklist" in flags else "false"
+    research = "--research" in flags
     go = "--yes" in flags
-    print("%squeue-rm %d item(s) (removeFromClient=%s, blocklist=%s):" % (
-        "" if go else "[dry-run] ", len(targets), rm_client, blocklist))
-    for t in targets:
+    print("%squeue-rm %d item(s) (removeFromClient=%s, blocklist=%s%s):" % (
+        "" if go else "[dry-run] ", len(targets), rm_client, blocklist,
+        ", re-search" if research else ""))
+    for t in targets[:40]:
         print("  %-10s %s" % (t["id"], t["title"][:70]))
+    if len(targets) > 40:
+        print("  … and %d more" % (len(targets) - 40))
     if not go:
         print("  (pass --yes to remove)")
         return
-    failed = 0
+    failed, affected = 0, set()
     for t in targets:
         for attempt in (1, 2):
             try:
                 api(svc, "DELETE", "/queue/%d?removeFromClient=%s&blocklist=%s" % (
                     t["id"], rm_client, blocklist))
                 print("  removed: %s" % t["title"][:70])
+                if t.get(idkey):
+                    affected.add(t[idkey])
                 break
             except SystemExit:  # 500 database-locked under load / stale id (404)
                 if attempt == 1:
@@ -991,8 +1015,158 @@ def cmd_queue_rm(svc, args):
                     continue
                 failed += 1
                 print("  FAILED (kept): %s — retry once the arr settles" % t["title"][:70])
+    if research and affected:
+        _research_items(svc, affected)
+        print("re-search queued for %d %s" % (
+            len(affected), "series" if svc.startswith("sonarr") else "movie(s)"))
     if failed:
         sys.exit(1)
+
+
+def _is_disc_record(r):
+    """A raw-disc queue record — full Blu-ray/DVD structure (ISO/BDMV/VIDEO_TS).
+    The arr classifies these as BR-DISK; they neither import nor feed the encoder,
+    so a queue full of them is wasted bytes. Quality name is authoritative; the
+    title tokens catch anything the classifier misses."""
+    qname = ((r.get("quality") or {}).get("quality") or {}).get("name") or ""
+    if qname in ("BR-DISK", "Raw-HD"):
+        return True
+    t = (r.get("title") or "").lower()
+    return any(tok in t for tok in (
+        "bdmv", ".iso", " iso", "video_ts", "complete.bluray",
+        "complete.uhd.bluray", "full.bluray", "complete blu-ray"))
+
+
+_QUEUE_STATE_PREDS = {
+    "failed": lambda r: r.get("status") == "failed",
+    "stuck": _is_stuck_queue_record,
+    "downloading": lambda r: r.get("status") == "downloading",
+    "paused": lambda r: r.get("status") == "paused",
+    "importing": lambda r: r.get("trackedDownloadState") in ("importPending", "importBlocked"),
+}
+
+
+def _queue_select(records, flags, positional):
+    """Filter queue records by any mix of selectors — the shared language of
+    `queue` (view) and `queue-rm` (act). positional: numeric queue ids (exact) or
+    a title substring (back-compat). flags: --title PAT, --disc, --quality NAME,
+    --status STATE (failed|stuck|downloading|paused|importing, or a raw status)."""
+    sel = list(records)
+    ids = {int(p) for p in positional if str(p).isdigit()}
+    words = [p for p in positional if not str(p).isdigit()]
+    if ids:
+        sel = [r for r in sel if r.get("id") in ids]
+    title_pat = flags.get("--title") or (" ".join(words) if words else None)
+    if title_pat:
+        tl = title_pat.lower()
+        sel = [r for r in sel if tl in (r.get("title", "") or "").lower()]
+    if "--disc" in flags:
+        sel = [r for r in sel if _is_disc_record(r)]
+    if flags.get("--quality"):
+        qn = flags["--quality"].lower()
+        sel = [r for r in sel
+               if (((r.get("quality") or {}).get("quality") or {}).get("name") or "").lower() == qn]
+    if flags.get("--status"):
+        st = flags["--status"].lower()
+        pred = _QUEUE_STATE_PREDS.get(st, lambda r, s=st: (r.get("status") or "").lower() == s)
+        sel = [r for r in sel if pred(r)]
+    return sel
+
+
+def _research_items(svc, item_ids):
+    """Trigger a fresh search for the given movie/series ids (after removing a bad
+    grab, so the arr picks an importable replacement)."""
+    ids = [i for i in item_ids if i]
+    if not ids:
+        return
+    if svc.startswith("sonarr"):
+        for iid in ids:
+            api(svc, "POST", "/command", {"name": "SeriesSearch", "seriesId": iid})
+    else:
+        api("radarr", "POST", "/command", {"name": "MoviesSearch", "movieIds": ids})
+
+
+def _disk_free_bytes(path="/data"):
+    try:
+        s = os.statvfs(path)
+        return s.f_bavail * s.f_frsize, s.f_blocks * s.f_frsize
+    except OSError:
+        return None, None
+
+
+def cmd_queue_overview(args):
+    """Top-level `arr queue` — one rollup across SAB + every arr queue: total
+    jobs, TB remaining, ETA, per-category counts, a quality histogram that flags
+    raw-disc releases (won't import), and free space vs. what's left to download.
+    The whole-picture answer to "what's the queue looking like?"."""
+    flags, _ = pop_flags(args, {"--json": 0})
+    sabq = (sab_api("queue", {"start": "0", "limit": "100000"}) or {}).get("queue", {}) or {}
+    slots = sabq.get("slots", []) or []
+    cat_counts, state_counts = {}, {}
+    for s in slots:
+        cat_counts[s.get("cat") or "?"] = cat_counts.get(s.get("cat") or "?", 0) + 1
+        st = s.get("status") or "?"
+        state_counts[st] = state_counts.get(st, 0) + 1
+    try:
+        mbleft = float(sabq.get("mbleft") or 0)
+        mbtot = float(sabq.get("mb") or 0)
+    except ValueError:
+        mbleft = mbtot = 0.0
+    tb_left = round(mbleft / 1048576, 2)
+    # len(slots) is authoritative (paused included) — noofslots_total under-counts.
+    total_jobs = max(len(slots), int(sabq.get("noofslots_total") or 0))
+
+    # quality histogram + disc tally across the arr queues (SAB slots carry no quality)
+    qual, disc_by_svc = {}, {}
+    for svc in ("radarr", "sonarr", "sonarr-anime"):
+        try:
+            recs = _queue_records(svc, page_size=2000)["records"]
+        except SystemExit:
+            continue
+        d = 0
+        for r in recs:
+            name = ((r.get("quality") or {}).get("quality") or {}).get("name") or "?"
+            qual[name] = qual.get(name, 0) + 1
+            if _is_disc_record(r):
+                d += 1
+        if d:
+            disc_by_svc[svc] = d
+    disc_total = sum(disc_by_svc.values())
+    free_b, _tot_b = _disk_free_bytes("/data")
+
+    if "--json" in flags:
+        print(json.dumps({
+            "totalJobs": total_jobs, "speed": sabq.get("speed"),
+            "tbLeft": tb_left, "eta": sabq.get("timeleft"),
+            "paused": sabq.get("paused"), "byCategory": cat_counts,
+            "byState": state_counts, "byQuality": qual,
+            "discItems": disc_by_svc, "discTotal": disc_total,
+            "freeGB": gb(free_b) if free_b is not None else None,
+        }, indent=2))
+        return
+
+    print("queue: %d job(s) in SABnzbd — %s left, %s @ %s, ETA %s%s" % (
+        total_jobs, ("%.2f TiB" % tb_left) if tb_left >= 1 else ("%d GiB" % round(mbleft / 1024)),
+        "downloading" if not sabq.get("paused") else "PAUSED",
+        (sabq.get("speed") or "?") + "B/s", sabq.get("timeleft") or "?",
+        ""))
+    if cat_counts:
+        print("  by category: " + ", ".join("%s %d" % (k, v) for k, v in sorted(
+            cat_counts.items(), key=lambda kv: -kv[1])))
+    if state_counts:
+        print("  by state:    " + ", ".join("%s %d" % (k, v) for k, v in sorted(
+            state_counts.items(), key=lambda kv: -kv[1])))
+    if qual:
+        print("  by quality:  " + ", ".join("%s %d" % (k, v) for k, v in sorted(
+            qual.items(), key=lambda kv: -kv[1])))
+    if free_b is not None:
+        head = free_b - int(mbleft * 1048576)
+        warn = "  ⚠ less than what's left to download" if head < 0 else ""
+        print("  /data free:  %sGB (vs %.2f TiB queued)%s" % (gb(free_b), tb_left, warn))
+    if disc_total:
+        where = ", ".join("%s %d" % (k, v) for k, v in disc_by_svc.items())
+        print("  ⚠ %d raw-disc item(s) (%s) — these won't import or re-encode; clear with "
+              "`arr <svc> queue-rm --disc --blocklist --research --yes`" % (disc_total, where))
 
 
 def cmd_history(svc, args):
@@ -3231,11 +3405,15 @@ Commands (sonarr & radarr unless noted):
         sonarr: --seasons X-Y [--keep-monitored] (surgical) | --all (whole series)
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
 
-Top-level (no service):
-  delete <title|id> ... [--yes] [--keep-downloads] [--blocklist]
-        works out per title whether it's a movie or a show, then removes it and
-        cancels its downloads. Mixed movie/show lists are fine — the one-liner
-        for "get rid of these" without naming radarr/sonarr each time.
+Top-level (no service prefix):
+  queue [--json]                  whole-picture rollup across SAB + every arr
+        queue: total jobs, TB left, ETA, per-category/state/quality counts,
+        free space vs. queued, and a raw-disc warning. (Per-service `arr <svc>
+        queue` is the filterable item listing.)
+  delete <title|id> ...           removes each item whether it's a movie or a
+        show and cancels its downloads; mixed lists fine. [--yes]
+        [--keep-downloads] [--blocklist]
+
   parse "<release title>"         show how the arr maps a title (series+episode)
   import <folder> --series <id|query> [--match SUBSTR] [--season N]
         [--map auto|abs|se] [--mode copy|move] [--batch N] [--dry-run] [--wait]  (sonarr)
@@ -3245,9 +3423,13 @@ Top-level (no service):
         Chunks --batch files per API call (default 10) so big imports can't time out.
   import <folder> --movie <id|query> [--match SUBSTR] [--mode copy|move]
         [--dry-run] [--wait]   (radarr) force-import file(s) into a movie
-  queue [query]                    show download queue
-  queue-rm <id|pat> [--blocklist] [--keep-files] [--yes]   remove queue record(s)
-        via API (dry-run unless --yes); default also removes from download client
+  queue [query] [--disc|--quality NAME|--status STATE] [--ids]   list queue items
+        filter by title/quality/state; --ids prints just ids to pipe into queue-rm
+  queue-rm <id…|pat> [--disc|--quality NAME|--status STATE]
+        [--blocklist] [--keep-files] [--research] [--yes]   remove queue record(s)
+        via API (dry-run unless --yes); default removes from the download client.
+        --research re-searches the affected movies/shows. A raw-disc sweep:
+        `arr radarr queue-rm --disc --blocklist --research --yes`
   stuck [query] [--json|--quiet] [--fix [--yes]]   queue items needing intervention
         --fix: auto-plan force-imports for import-blocked items (applies w/ --yes);
         failed items get a suggested queue-rm+re-grab line
@@ -3323,6 +3505,9 @@ def main(argv):
         return
     if svc == "delete":
         cmd_delete_auto(argv[1:])
+        return
+    if svc == "queue":
+        cmd_queue_overview(argv[1:])
         return
     if svc not in SERVICES:
         die("unknown service '%s' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr)" % svc)
