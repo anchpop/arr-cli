@@ -736,10 +736,11 @@ def _queue_record_summary(r):
 
 
 def cmd_queue(svc, args):
-    """List queue items. Filter with a title substring or --disc/--quality NAME/
-    --status STATE; --ids prints just the queue ids (pipe into queue-rm)."""
+    """List queue items. Filter with a title substring or --disc/--encrypted/
+    --quality NAME/--status STATE; --ids prints just the queue ids (pipe into
+    queue-rm)."""
     flags, rest = pop_flags(args, {"--disc": 0, "--quality": 1, "--status": 1,
-                                   "--title": 1, "--ids": 0})
+                                   "--title": 1, "--ids": 0, "--encrypted": 0})
     q = _queue_records(svc, page_size=1000)
     sel = _queue_select(q["records"], flags, rest)
     if "--ids" in flags:
@@ -748,9 +749,12 @@ def cmd_queue(svc, args):
         return
     filt = "" if len(sel) == q["totalRecords"] else " (of %d)" % q["totalRecords"]
     print("queue: %d item(s)%s" % (len(sel), filt))
+    sab_labels = _sab_flagged_labels()
     for r in sel:
-        print("  %s/%s  %sMB left  %s" % (
-            r.get("status"), r.get("trackedDownloadState"), mb(r.get("sizeleft")), r.get("title")))
+        lbl = sab_labels.get((r.get("downloadId") or "").lower(), [])
+        print("  %s/%s  %sMB left  %s%s" % (
+            r.get("status"), r.get("trackedDownloadState"), mb(r.get("sizeleft")),
+            ("[%s] " % ",".join(lbl)) if lbl else "", r.get("title")))
         if r.get("errorMessage"):
             print("        err: " + r["errorMessage"])
         msgs = _queue_status_messages(r)
@@ -958,10 +962,11 @@ def cmd_episodes(svc, args):
 def cmd_queue_rm(svc, args):
     """Remove queue record(s) by id or title pattern — the API way, no raw curl.
 
-    arr <svc> queue-rm <id…|pattern> [--disc|--quality NAME|--status STATE]
+    arr <svc> queue-rm <id…|pattern> [--disc|--encrypted|--quality NAME|--status STATE]
         [--blocklist] [--keep-files] [--research] [--yes]
     Selects by queue id(s), a title substring, or a selector shared with `queue`
-    (--disc = raw-disc BR-DISK/ISO, --quality NAME, --status failed|stuck|…).
+    (--disc = raw-disc BR-DISK/ISO, --encrypted = SAB-flagged password-protected
+    fakes, --quality NAME, --status failed|stuck|…).
     Default removes the download from the client (removeFromClient=true);
     --keep-files leaves it; --blocklist avoids re-grabbing the same release;
     --research re-searches the affected movies/shows for a replacement. Dry-run
@@ -969,9 +974,10 @@ def cmd_queue_rm(svc, args):
         arr radarr queue-rm --disc --blocklist --research --yes"""
     flags, rest = pop_flags(args, {"--blocklist": 0, "--keep-files": 0, "--yes": 0,
                                    "--disc": 0, "--quality": 1, "--status": 1,
-                                   "--title": 1, "--research": 0})
+                                   "--title": 1, "--research": 0, "--encrypted": 0})
     idkey = "seriesId" if svc.startswith("sonarr") else "movieId"
-    selectors = ("--disc" in flags or flags.get("--quality") or flags.get("--status")
+    selectors = ("--disc" in flags or "--encrypted" in flags
+                 or flags.get("--quality") or flags.get("--status")
                  or flags.get("--title"))
     numeric_only = rest and all(str(x).isdigit() for x in rest)
     if not rest and not selectors:
@@ -984,6 +990,19 @@ def cmd_queue_rm(svc, args):
         sel = _queue_select(recs, flags, rest)
         if not sel:
             die("queue-rm: nothing matched")
+        if "--keep-files" not in flags:
+            # A season pack is one download fanned out into per-episode queue
+            # records. Removing from the client takes the whole pack out on the
+            # first record — deleting the rest would just 404 on stale ids.
+            seen_dl, dedup = set(), []
+            for r in sel:
+                dl = r.get("downloadId")
+                if dl and dl in seen_dl:
+                    continue
+                if dl:
+                    seen_dl.add(dl)
+                dedup.append(r)
+            sel = dedup
         targets = [{"id": r["id"], "title": r.get("title", ""), idkey: r.get(idkey)} for r in sel]
     rm_client = "false" if "--keep-files" in flags else "true"
     blocklist = "true" if "--blocklist" in flags else "false"
@@ -1037,6 +1056,19 @@ def _is_disc_record(r):
         "complete.uhd.bluray", "full.bluray", "complete blu-ray"))
 
 
+def _sab_flagged_labels():
+    """SAB's own per-job diagnosis: {nzo_id (lowercase): [labels]}. The labels
+    SAB sets are the actionable ones the arrs can't see — ENCRYPTED (password-
+    protected rar = fake release, job sits Paused forever), DUPLICATE,
+    ALTERNATIVE. Keyed lowercase because the arrs store downloadId in whatever
+    case they please."""
+    try:
+        slots = (sab_api("queue", {"start": "0", "limit": "100000"}) or {}).get("queue", {}).get("slots", []) or []
+    except SystemExit:
+        return {}
+    return {(s.get("nzo_id") or "").lower(): (s.get("labels") or []) for s in slots}
+
+
 _QUEUE_STATE_PREDS = {
     "failed": lambda r: r.get("status") == "failed",
     "stuck": _is_stuck_queue_record,
@@ -1062,6 +1094,10 @@ def _queue_select(records, flags, positional):
         sel = [r for r in sel if tl in (r.get("title", "") or "").lower()]
     if "--disc" in flags:
         sel = [r for r in sel if _is_disc_record(r)]
+    if "--encrypted" in flags:
+        labels = _sab_flagged_labels()
+        sel = [r for r in sel
+               if "ENCRYPTED" in labels.get((r.get("downloadId") or "").lower(), [])]
     if flags.get("--quality"):
         qn = flags["--quality"].lower()
         sel = [r for r in sel
@@ -1116,22 +1152,33 @@ def cmd_queue_overview(args):
     # len(slots) is authoritative (paused included) — noofslots_total under-counts.
     total_jobs = max(len(slots), int(sabq.get("noofslots_total") or 0))
 
-    # quality histogram + disc tally across the arr queues (SAB slots carry no quality)
-    qual, disc_by_svc = {}, {}
+    # SAB-flagged encrypted jobs: password-protected rars = fake releases. SAB
+    # pauses them and they sit forever unless someone acts.
+    enc_ids = {(s.get("nzo_id") or "").lower() for s in slots
+               if "ENCRYPTED" in (s.get("labels") or [])}
+
+    # quality histogram + disc/encrypted tally across the arr queues (SAB slots
+    # carry no quality; the arrs know which movie/series a job belongs to)
+    qual, disc_by_svc, enc_by_svc = {}, {}, {}
     for svc in ("radarr", "sonarr", "sonarr-anime"):
         try:
             recs = _queue_records(svc, page_size=2000)["records"]
         except SystemExit:
             continue
-        d = 0
+        d = e = 0
         for r in recs:
             name = ((r.get("quality") or {}).get("quality") or {}).get("name") or "?"
             qual[name] = qual.get(name, 0) + 1
             if _is_disc_record(r):
                 d += 1
+            if (r.get("downloadId") or "").lower() in enc_ids:
+                e += 1
         if d:
             disc_by_svc[svc] = d
+        if e:
+            enc_by_svc[svc] = e
     disc_total = sum(disc_by_svc.values())
+    enc_total = sum(enc_by_svc.values())
     free_b, _tot_b = _disk_free_bytes("/data")
 
     if "--json" in flags:
@@ -1141,6 +1188,7 @@ def cmd_queue_overview(args):
             "paused": sabq.get("paused"), "byCategory": cat_counts,
             "byState": state_counts, "byQuality": qual,
             "discItems": disc_by_svc, "discTotal": disc_total,
+            "encryptedItems": enc_by_svc, "encryptedTotal": enc_total,
             "freeGB": gb(free_b) if free_b is not None else None,
         }, indent=2))
         return
@@ -1167,6 +1215,11 @@ def cmd_queue_overview(args):
         where = ", ".join("%s %d" % (k, v) for k, v in disc_by_svc.items())
         print("  ⚠ %d raw-disc item(s) (%s) — these won't import or re-encode; clear with "
               "`arr <svc> queue-rm --disc --blocklist --research --yes`" % (disc_total, where))
+    if enc_total:
+        where = ", ".join("%s %d" % (k, v) for k, v in enc_by_svc.items())
+        print("  ⚠ %d ENCRYPTED job(s) (%s) — password-protected rar = fake release, SAB has "
+              "them paused forever; clear with `arr <svc> queue-rm --encrypted --blocklist "
+              "--research --yes`" % (enc_total, where))
 
 
 def cmd_history(svc, args):
@@ -3423,9 +3476,9 @@ Top-level (no service prefix):
         Chunks --batch files per API call (default 10) so big imports can't time out.
   import <folder> --movie <id|query> [--match SUBSTR] [--mode copy|move]
         [--dry-run] [--wait]   (radarr) force-import file(s) into a movie
-  queue [query] [--disc|--quality NAME|--status STATE] [--ids]   list queue items
+  queue [query] [--disc|--encrypted|--quality NAME|--status STATE] [--ids]   list queue items
         filter by title/quality/state; --ids prints just ids to pipe into queue-rm
-  queue-rm <id…|pat> [--disc|--quality NAME|--status STATE]
+  queue-rm <id…|pat> [--disc|--encrypted|--quality NAME|--status STATE]
         [--blocklist] [--keep-files] [--research] [--yes]   remove queue record(s)
         via API (dry-run unless --yes); default removes from the download client.
         --research re-searches the affected movies/shows. A raw-disc sweep:
