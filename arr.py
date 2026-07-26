@@ -12,6 +12,7 @@ Key source (first hit wins):
 """
 import json
 import os
+import stat
 import re
 import shutil
 import subprocess
@@ -876,7 +877,19 @@ def cmd_stuck(svc, args):
             # throws DirectoryNotFound — pre-create it if we're allowed to
             try:
                 if item.get("path"):
-                    os.makedirs(item["path"], exist_ok=True)
+                    target = item["path"]
+                    os.makedirs(target, mode=0o770, exist_ok=True)
+                    # arr may run as a helper user while Radarr/Sonarr writes as
+                    # a service user in the parent directory's shared group.
+                    # A newly-created helper-owned directory would otherwise be
+                    # unwritable by the service and ManualImport misleadingly
+                    # completes while importing nothing.  When we own the
+                    # target, inherit the parent's group and grant group rwx.
+                    target_st = os.stat(target)
+                    if target_st.st_uid == os.geteuid():
+                        parent_gid = os.stat(os.path.dirname(target)).st_gid
+                        os.chown(target, -1, parent_gid)
+                        os.chmod(target, stat.S_IMODE(target_st.st_mode) | stat.S_IRWXG)
             except OSError:
                 pass
             _run_manual_import(svc, payload, "move", wait=True)
