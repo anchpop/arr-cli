@@ -20,7 +20,7 @@ Rust CLI reaches parity and the nix wrapper is cut over — do not modify it.
    `⚠` warnings, and stderr-vs-stdout choice. When Python does `"%s" % round(x,1)`
    use `format!("{:.1}", ...)`; `gb()`/`fmt_gb()`/`mb()` exist in arr-api.
 2. **Exit codes are API.** `die()` = exit 1. `watch` exits 0/1/2/3/4 (worst-wins
-   across targets). `delete` without `--yes` is a dry-run that exits 1.
+   across targets). `delete` without `--yes` is a dry-run (exits 0 for `arr <svc> delete`, matching arr.py).
 3. **Flags are API.** Port `pop_flags` specs exactly — same flag names, same
    nargs. No clap, no new flags, no renamed flags.
 4. **Dict-poking via `JsonExt`** (`v.s("title")`, `v.i("id")`, `v.a("seasons")`,

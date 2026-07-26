@@ -8,28 +8,81 @@
 
 use arr_api::die;
 
+mod acquire;
+mod browse;
+mod disk;
+mod integrations;
+mod policy;
 mod usage;
 
 fn main() {
-    // Python gets SIG_DFL for SIGPIPE by default via signal(); Rust ignores it,
-    // which turns `arr ... | head` into a broken-pipe panic. Restore default.
+    // Python gets SIG_DFL for SIGPIPE by default; Rust ignores it, which turns
+    // `arr ... | head` into a broken-pipe panic. Restore default.
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() || matches!(argv[0].as_str(), "-h" | "--help" | "help") {
-        println!("{}", usage::USAGE);
+        println!("{}", usage::usage());
         std::process::exit(if argv.is_empty() { 1 } else { 0 });
     }
     let svc = argv[0].as_str();
     let rest: Vec<String> = argv[1..].to_vec();
     match svc {
-        "sab" => dispatch_family("sab", &rest, "queue|status|add|prio|history|cleanup"),
-        "jellyfin" => dispatch_family("jellyfin", &rest, "unwatched|has|refresh"),
-        "seerr" => dispatch_family("seerr", &rest, "requests|request|unfulfilled"),
-        "bazarr" => dispatch_family("bazarr", &rest, "status|wanted|search|raw"),
-        "delete" => todo_cmd("delete-auto"),
-        "queue" => todo_cmd("queue-overview"),
+        "sab" => {
+            if rest.is_empty() {
+                die("sab: queue|status|add|prio|history|cleanup");
+            }
+            let args = &rest[1..];
+            match rest[0].as_str() {
+                "queue" => disk::sab_queue(args),
+                "status" => disk::sab_status(args),
+                "add" => disk::sab_add(args),
+                "prio" => disk::sab_prio(args),
+                "history" => disk::sab_history(args),
+                "cleanup" => disk::sab_cleanup(args),
+                c => die(&format!("unknown sab command '{}'", c)),
+            }
+        }
+        "jellyfin" => {
+            if rest.is_empty() {
+                die("jellyfin: unwatched|has|refresh");
+            }
+            let args = &rest[1..];
+            match rest[0].as_str() {
+                "unwatched" => disk::cmd_jf_unwatched(args),
+                "has" => integrations::cmd_jf_has(args),
+                "refresh" => integrations::cmd_jf_refresh(args),
+                c => die(&format!("unknown jellyfin command '{}'", c)),
+            }
+        }
+        "seerr" => {
+            if rest.is_empty() {
+                die("seerr: requests|request|unfulfilled");
+            }
+            let args = &rest[1..];
+            match rest[0].as_str() {
+                "requests" => integrations::seerr_requests(args),
+                "request" => integrations::seerr_request(args),
+                "unfulfilled" => integrations::seerr_unfulfilled(args),
+                c => die(&format!("unknown seerr command '{}'", c)),
+            }
+        }
+        "bazarr" => {
+            if rest.is_empty() {
+                die("bazarr: status|wanted|search|raw");
+            }
+            let args = &rest[1..];
+            match rest[0].as_str() {
+                "status" => integrations::bazarr_status(args),
+                "wanted" => integrations::bazarr_wanted(args),
+                "search" => integrations::bazarr_search(args),
+                "raw" => integrations::bazarr_raw(args),
+                c => die(&format!("unknown bazarr command '{}'", c)),
+            }
+        }
+        "delete" => disk::cmd_delete_auto(&rest),
+        "queue" => acquire::cmd_queue_overview(&rest),
         _ => {
             if arr_api::svc_cfg(svc).is_none() {
                 die(&format!(
@@ -38,32 +91,42 @@ fn main() {
                 ));
             }
             if rest.is_empty() {
-                println!("{}", usage::USAGE);
+                println!("{}", usage::usage());
                 std::process::exit(1);
             }
-            dispatch_svc(svc, rest[0].as_str(), &rest[1..]);
+            let (cmd, args) = (rest[0].as_str(), &rest[1..]);
+            match cmd {
+                "status" => browse::cmd_status(svc, args),
+                "get" => browse::cmd_get(svc, args),
+                "seasons" => browse::cmd_seasons(svc, args),
+                "releases" => browse::cmd_releases(svc, args),
+                "grab" => acquire::cmd_grab(svc, args),
+                "monitor" => browse::cmd_monitor(svc, args),
+                "queue" => browse::cmd_queue(svc, args),
+                "queue-rm" => acquire::cmd_queue_rm(svc, args),
+                "stuck" => acquire::cmd_stuck(svc, args),
+                "episodes" => browse::cmd_episodes(svc, args),
+                "wait" => browse::cmd_wait(svc, args),
+                "history" => browse::cmd_history(svc, args),
+                "wanted" => browse::cmd_wanted(svc, args),
+                "parse" => browse::cmd_parse(svc, args),
+                "search" => browse::cmd_search(svc, args),
+                "import" => acquire::cmd_import(svc, args),
+                "files" => disk::cmd_files(svc, args),
+                "delete" => disk::cmd_delete(svc, args),
+                "audit" => disk::cmd_audit(svc, args),
+                "availability" => disk::cmd_availability(svc, args),
+                "lookup" => disk::cmd_lookup(svc, args),
+                "info" => disk::cmd_info(svc, args),
+                "tag" => browse::cmd_tag(svc, args),
+                "raw" => browse::cmd_raw(svc, args),
+                "add" => policy::cmd_add(svc, args),
+                "coverage" => policy::cmd_coverage(svc, args),
+                "tracks" => policy::cmd_tracks(svc, args),
+                "watch" => policy::cmd_watch(svc, args),
+                "replace" => policy::cmd_replace(svc, args),
+                c => die(&format!("unknown command '{}' (try: arr --help)", c)),
+            }
         }
     }
-}
-
-fn dispatch_family(family: &str, rest: &[String], cmds: &str) {
-    if rest.is_empty() {
-        die(&format!("{}: {}", family, cmds));
-    }
-    let cmd = rest[0].as_str();
-    let _args = &rest[1..];
-    match (family, cmd) {
-        _ => die(&format!("unknown {} command '{}'", family, cmd)),
-    }
-}
-
-fn dispatch_svc(svc: &str, cmd: &str, args: &[String]) {
-    let _ = (svc, args);
-    match cmd {
-        _ => die(&format!("unknown command '{}' (try: arr --help)", cmd)),
-    }
-}
-
-fn todo_cmd(name: &str) -> ! {
-    die(&format!("{}: not yet ported", name));
 }

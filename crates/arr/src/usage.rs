@@ -1,5 +1,5 @@
 // Auto-extracted from arr.py USAGE — keep in sync when commands change.
-pub const USAGE: &str = r#"arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
+const USAGE_TPL: &str = r#"arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
 
   arr <service> <command> [args]
   service: sonarr | sonarr-anime | radarr | prowlarr | sab | jellyfin | seerr | bazarr
@@ -152,3 +152,7 @@ Bazarr (subtitle manager — covers MAIN sonarr + radarr; NOT sonarr-anime):
 
 Keys come from $ARR_API_KEY_<SVC> / $ARR_API_KEY_{SAB,JELLYFIN,SEERR} or the
 sops-rendered env file (%s). No sudo required."#;
+
+pub fn usage() -> String {
+    USAGE_TPL.replace("%s", &arr_api::env::env_file_path())
+}
