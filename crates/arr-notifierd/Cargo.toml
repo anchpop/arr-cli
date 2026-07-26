@@ -1,0 +1,17 @@
+[package]
+name = "arr-notifierd"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "arr-notifierd"
+path = "src/main.rs"
+
+[dependencies]
+arr-api = { path = "../arr-api" }
+serde_json.workspace = true
+ureq.workspace = true
+rusqlite.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hex.workspace = true

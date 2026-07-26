@@ -1,0 +1,13 @@
+[package]
+name = "arr"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "arr"
+path = "src/main.rs"
+
+[dependencies]
+arr-api = { path = "../arr-api" }
+serde_json.workspace = true
+libc.workspace = true
