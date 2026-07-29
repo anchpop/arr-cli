@@ -2,9 +2,27 @@
 const USAGE_TPL: &str = r#"arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI
 
   arr <service> <command> [args]
+  arr <command> <title> [args]    service optional — see below
   service: sonarr | sonarr-anime | radarr | prowlarr | sab | jellyfin | seerr | bazarr
   (sonarr-anime = the dedicated anime Sonarr on :8990; all sonarr commands work
    against it, e.g. `arr sonarr-anime status`, `arr sonarr-anime seasons <show>`)
+
+THE SERVICE PREFIX IS OPTIONAL. `arr status 'Lycoris Recoil'` resolves the
+title across radarr + sonarr + sonarr-anime and runs against whichever holds
+it, printing the service it picked. Use this by default: guessing the wrong
+instance returns "no match", which reads exactly like "not in the library" —
+the usual reason a lookup turns into a six-command hunt. Anime lives on
+sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
+  works for: status get seasons releases grab monitor episodes history files
+             audit availability info tag coverage tracks
+  put the TITLE FIRST, flags after it. A numeric id still needs its service
+  (ids are only unique within one instance). Ambiguous titles list candidates.
+
+  arr where <title>               WHERE IS THIS? one call, whole pipeline:
+        which service holds it, what's on disk (per-season for shows), what's
+        in the arr + SAB queues, the Seerr request state, whether Jellyfin can
+        see it, and the command that moves it forward. Start here for "is it
+        downloading?" / "why isn't X there?" instead of checking each service.
 
 Commands (sonarr & radarr unless noted):
   status [query]                  list items (optionally filter by title)
@@ -54,13 +72,23 @@ Commands (sonarr & radarr unless noted):
         (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi;
          --timeout: raise past the 300s default — anime searches can exceed it)
   grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run]
-        [--wait] [--no-wait]
+        [--wait] [--no-wait] [--monitor]
         no flags: search & let the arr decide (respects quality profile), then
         wait up to 60s and report what got grabbed (--no-wait skips; --timeout
-        adjusts). --override: force-push every candidate release (bypass
-        rejections). --via-sab: send candidate NZBs straight to SAB (bypass
-        search cache). --wait: also block until the search command itself
-        finishes (--timeout SECS, def 300)
+        adjusts). Fresh grabs — and anything already downloading for this item —
+        are promoted to the front of the queue, so this doubles as "I want this
+        NOW" on something already in flight.
+        Converges on the two states where a bare search achieves nothing:
+        NOT IN THE LIBRARY -> hands off to `add` (same intent: monitor, search,
+        wait, promote), so you don't have to know which verb applies; and
+        UNMONITORED -> the arrs' *Search commands skip unmonitored items, so a
+        search "succeeds" and grabs nothing. grab reports that and stops;
+        --monitor turns monitoring on first (ADDITIVE — unlike `monitor <id> s2`,
+        which unmonitors every other season) and then searches.
+        --override: force-push every candidate release (bypass rejections).
+        --via-sab: send candidate NZBs straight to SAB (bypass search cache).
+        --wait: also block until the search command itself finishes
+        (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
   tag <id|query> [--requester <discordId>] [--require-subs LANG]
@@ -94,6 +122,7 @@ Commands (sonarr & radarr unless noted):
         radarr: --file-only (drop file, keep movie) | (default: movie + file)
 
 Top-level (no service prefix):
+  where <title>                   the whole pipeline for one title (see top)
   queue [--json]                  whole-picture rollup across SAB + every arr
         queue: total jobs, TB left, ETA, per-category/state/quality counts,
         free space vs. queued, and a raw-disc warning. (Per-service `arr <svc>

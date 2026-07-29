@@ -1,7 +1,7 @@
 ---
 name: media-server-operations
 description: "Use when administering the Sonarr/Radarr/SABnzbd/qBittorrent/Jellyfin media stack: media requests, missing or stuck downloads, failed downloads, import blocks, duplicate/wrong episodes, subtitle and dub gaps or backfills, Seerr request repair, release selection, library scans and safe library fixes — including when woken by the queue-stuck / download-failed / language-gap webhooks. Not for media generation (music/image/video creation)."
-version: 3.1.0
+version: 3.2.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -18,13 +18,20 @@ Most routine operation of the services on this media server can be carried out w
 
 It's better to use `arr` when possible because it can capture institutional knowledge and patterns, but direct REST calls of course still fine if you find the capabilities offered by `arr` to be insufficient. `arr --help` is the flag reference.
 
+**Leave the service prefix off.** `arr status 'Lycoris Recoil'` resolves the title across radarr, sonarr and sonarr-anime and prints which instance it picked. This is the better default, and it matters most for anime: anime lives on the separate `sonarr-anime` instance, so `arr sonarr status '<anime>'` answers "no match" — which reads exactly like "we don't have it" and turns a one-command lookup into a hunt through SAB, Seerr and the main Sonarr for something that was one instance over. Title-first works for `status`, `grab`, `coverage`, `files`, `info`, `audit`, `tracks`, `releases`, `history`, `episodes`, `seasons`, `monitor`, `tag`, `availability` and `get`. Put the title first and flags after it; a numeric id still needs its service, since ids repeat across instances.
+
+**Start any "where is X?" question with `arr where '<title>'`.** One call reports the whole pipeline: which service holds it, per-season disk state, what's in the arr and SAB queues, the Seerr request and its status, whether Jellyfin can see it, and the command that moves it forward. It replaces the status → queue → sab queue → seerr sweep, and it surfaces the case per-service checks miss entirely — a Seerr request sitting in FAILED with nothing queued anywhere, which is the usual reality behind "it's been downloading for ages".
+
 ## Cookbook
 
 **Someone asks for a movie or show.**
 `arr radarr add '<title>' --requester <theirDiscordId>` — or `arr sonarr add` / `arr sonarr-anime add  --requester <theirDiscordId>` for shows (anime belongs on the anime instance). If the request mentions language, add `--require-subs eng` and/or `--require-audio <lang>`; when they didn't spell it out, if it's a foreign movie or the user has expressed a preference you might still pick a sensible default (e.g. original audio + English subs, plus you can always ask them what their preference is). The command refuses ambiguous titles (disambiguate with `arr <svc> lookup`, re-add with `--tvdb`/`--tmdb`), and its output already answers the request: what got grabbed (it waits up to a minute and bumps the grab to the front of the download queue) or, for a show that's already in the library, its per-season coverage and any warnings. Reply from that output. From there the download-notifier DMs the requester a live progress embed, confirms the item in Jellyfin, and ffprobe-verifies any require-* tags on the finished files — following up is its job, not yours.
 
 **"Where's my request?" / something didn't arrive.**
-`arr <svc> status '<title>'` — a single match prints per-season gaps and unmanaged-file warnings. `arr seerr unfulfilled` cross-checks every website request against actual disk state. `arr <svc> releases '<title>' --season N` shows what the indexers have and why candidates were rejected (anime indexer searches run long; `--timeout 600`). `arr <svc> history '<title>'` shows grabs and failures. Old obscure content often has only dead releases — after the arr exhausts its candidates, "currently unobtainable" is a real and honest answer.
+`arr where '<title>'` first — it answers the question outright and tells you which of the follow-ups below is even relevant. Then, as needed: `arr status '<title>'` — a single match prints per-season gaps and unmanaged-file warnings. `arr seerr unfulfilled` cross-checks every website request against actual disk state. `arr <svc> releases '<title>' --season N` shows what the indexers have and why candidates were rejected (anime indexer searches run long; `--timeout 600`). `arr <svc> history '<title>'` shows grabs and failures. Old obscure content often has only dead releases — after the arr exhausts its candidates, "currently unobtainable" is a real and honest answer.
+
+**"Can you prioritize X?" / "put X at the top of the download queue."**
+`arr grab '<title>'` is the whole answer whatever state it's in: it promotes anything already downloading for that item to the front of both the arr and SAB queues, and when nothing is in flight it searches and promotes whatever it grabs. If the title turns out not to be in the library it hands off to `add` (same intent — monitor, search, wait, promote), and if the season it needs is unmonitored it says so and offers `--monitor`, instead of running a search that would quietly grab nothing. Worth checking the premise with `arr where '<title>'` when the ask assumes something is already downloading: "put it at the top of the queue" frequently means the request failed and nothing is queued at all, and prioritizing an empty queue slot is not the fix they need.
 
 **A queue item is stuck or failing** (including `queue-stuck` / `download-failed` webhook wakes).
 Look before fixing: `arr <svc> stuck` — items that recovered or are progressing need nothing. For the rest, `arr <svc> stuck --fix` plans the safe repairs and applies them with `--yes` (maps import-blocked packs onto episodes, clears stale records, flags junk releases). Dead releases get `arr <svc> queue-rm <id> --blocklist --yes` so the arr grabs an alternative; real content that won't auto-match gets a manual import (below). The notifier keeps requester DMs updated by itself — no need to message anyone or create crons.

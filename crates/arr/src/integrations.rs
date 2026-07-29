@@ -467,7 +467,7 @@ pub fn seerr_unfulfilled(args: &[String]) {
 
 // --- Jellyfin ----------------------------------------------------------------
 
-fn jf_search_items(term: &str, limit: usize) -> Vec<Value> {
+pub fn jf_search_items(term: &str, limit: usize) -> Vec<Value> {
     let limit = limit.to_string();
     let r = jf_api(
         "/Items",

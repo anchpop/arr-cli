@@ -12,6 +12,7 @@ mod acquire;
 mod browse;
 mod disk;
 mod integrations;
+mod locate;
 mod policy;
 mod usage;
 
@@ -83,8 +84,15 @@ fn main() {
         }
         "delete" => disk::cmd_delete_auto(&rest),
         "queue" => acquire::cmd_queue_overview(&rest),
+        "where" => locate::cmd_where(&rest),
         _ => {
             if arr_api::svc_cfg(svc).is_none() {
+                // Service-optional dispatch: `arr status 'Lycoris Recoil'`.
+                // Nobody thinks in services, and guessing the wrong one returns
+                // "no match" — indistinguishable from "not in the library".
+                if locate::is_item_command(svc) {
+                    return locate::dispatch(svc, &rest);
+                }
                 die(&format!(
                     "unknown service '{}' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr)",
                     svc
@@ -94,8 +102,15 @@ fn main() {
                 println!("{}", usage::usage());
                 std::process::exit(1);
             }
-            let (cmd, args) = (rest[0].as_str(), &rest[1..]);
-            match cmd {
+            run_svc_command(svc, rest[0].as_str(), &rest[1..]);
+        }
+    }
+}
+
+/// The per-service command table. Called with an explicit service prefix, and
+/// by locate::dispatch after resolving a bare title to its owning service.
+pub fn run_svc_command(svc: &str, cmd: &str, args: &[String]) {
+    match cmd {
                 "status" => browse::cmd_status(svc, args),
                 "get" => browse::cmd_get(svc, args),
                 "seasons" => browse::cmd_seasons(svc, args),
@@ -126,7 +141,5 @@ fn main() {
                 "watch" => policy::cmd_watch(svc, args),
                 "replace" => policy::cmd_replace(svc, args),
                 c => die(&format!("unknown command '{}' (try: arr --help)", c)),
-            }
-        }
     }
 }

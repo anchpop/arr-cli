@@ -493,6 +493,92 @@ pub fn report_first_grab(svc: &str, iid: i64, is_series: bool, timeout: i64) -> 
     }
 }
 
+/// Monitoring gate. The arrs' *Search commands only consider MONITORED items,
+/// so grabbing an unmonitored season runs a search, reports success, and pulls
+/// nothing — a silent no-op that reads like "no releases exist". Report it
+/// (and stop, rather than burn the 60s wait); `--monitor` turns monitoring on
+/// additively — unlike `arr <svc> monitor <id> s2`, which unmonitors the rest.
+fn ensure_monitored(svc: &str, iid: i64, flags: &Flags, dry: bool) -> bool {
+    if flags.has("--episode") {
+        // explicit episode ids are searched regardless of monitoring
+        return true;
+    }
+    if svc == "radarr" {
+        let mut m = api(svc, "GET", &format!("/movie/{}", iid), None).unwrap_or(Value::Null);
+        if m.b("monitored") {
+            return true;
+        }
+        if flags.has("--monitor") && dry {
+            println!("DRY: would monitor movie {}", iid);
+            return true;
+        }
+        if !flags.has("--monitor") {
+            println!(
+                "  ⚠ this movie is NOT monitored — a search grabs nothing. Rerun with --monitor (or `arr radarr monitor {} on`)",
+                iid
+            );
+            return false;
+        }
+        m["monitored"] = Value::Bool(true);
+        api(svc, "PUT", &format!("/movie/{}", iid), Some(&m));
+        println!("  monitored the movie (was off)");
+        return true;
+    }
+
+    let mut s = api(svc, "GET", &format!("/series/{}", iid), None).unwrap_or(Value::Null);
+    let scope: Vec<i64> = match flags.has("--season") {
+        true => vec![py_int(flags.val_or("--season", ""))],
+        false => s.a("seasons").iter().map(|se| se.i("seasonNumber")).filter(|n| *n != 0).collect(),
+    };
+    let off: Vec<i64> = s
+        .a("seasons")
+        .iter()
+        .filter(|se| scope.contains(&se.i("seasonNumber")) && !se.b("monitored"))
+        .map(|se| se.i("seasonNumber"))
+        .collect();
+    if off.is_empty() && s.b("monitored") {
+        return true;
+    }
+    let names = |v: &[i64]| v.iter().map(|n| format!("S{}", n)).collect::<Vec<_>>().join(",");
+
+    if flags.has("--monitor") {
+        if dry {
+            println!(
+                "DRY: would monitor {} on series {}",
+                if off.is_empty() { "the series".to_string() } else { names(&off) },
+                iid
+            );
+            return true;
+        }
+        s["monitored"] = Value::Bool(true);
+        if let Some(seasons) = s.get_mut("seasons").and_then(Value::as_array_mut) {
+            for se in seasons {
+                if scope.contains(&se.i("seasonNumber")) {
+                    se["monitored"] = Value::Bool(true);
+                }
+            }
+        }
+        api(svc, "PUT", &format!("/series/{}", iid), Some(&s));
+        println!(
+            "  monitored {} (other seasons untouched)",
+            if off.is_empty() { "the series".to_string() } else { names(&off) }
+        );
+        return true;
+    }
+    if !off.is_empty() && off.len() == scope.len() {
+        println!(
+            "  ⚠ {} unmonitored — the search would grab nothing. Rerun with --monitor to include {}",
+            names(&off),
+            if off.len() == 1 { "it" } else { "them" }
+        );
+        return false;
+    }
+    if !off.is_empty() {
+        println!("  note: {} unmonitored and will be skipped; --monitor includes them", names(&off));
+    }
+    true
+}
+
 pub fn cmd_grab(svc: &str, args: &[String]) {
     if svc == "prowlarr" {
         return cmd_prowlarr_grab(args);
@@ -509,6 +595,7 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             ("--timeout", 1),
             ("--requester", 1),
             ("--no-wait", 0),
+            ("--monitor", 0),
         ],
     );
     if rest.is_empty() {
@@ -520,7 +607,10 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
     // Stamp the requester so the download-notifier DMs them with a progress bar.
     // Tagging the series/movie is branch-independent, so do it once up front.
     if let Some(req) = flag_truthy(&flags, "--requester") {
-        if !dry {
+        // Skip when it isn't in the library yet — the add handoff below passes
+        // --requester along, and tagging would resolve-and-die before we get
+        // there.
+        if !dry && crate::disk::resolve_soft(svc, &rest[0]).is_ok() {
             let (coll, id, did) = tag_requester(svc, &rest[0], req);
             println!("tagged requester:{} on {} #{}", did, coll, id);
         }
@@ -565,7 +655,30 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
 
     if !overridef {
         // let the arr search & decide (respects the quality profile)
-        let iid = resolve_id(svc, &rest[0]);
+        let iid = match crate::disk::resolve_soft(svc, &rest[0]) {
+            Ok(id) => id,
+            // Not in the library yet: `add` is the same intent (monitor +
+            // search + wait + promote), so converge instead of making the
+            // caller discover which of the two verbs applies.
+            Err(e) if e.starts_with("no match") => {
+                println!("not in the {} library yet — adding it (which searches too)", svc);
+                let mut add_args = vec![rest[0].clone()];
+                if let Some(v) = flag_truthy(&flags, "--requester") {
+                    add_args.push("--requester".into());
+                    add_args.push(v.to_string());
+                }
+                for f in ["--dry-run", "--no-wait"] {
+                    if flags.has(f) {
+                        add_args.push(f.into());
+                    }
+                }
+                return crate::policy::cmd_add(svc, &add_args);
+            }
+            Err(e) => die(&e),
+        };
+        if !ensure_monitored(svc, iid, &flags, dry) {
+            return;
+        }
         let (body, dry_str) = if svc.starts_with("sonarr") {
             if flags.has("--episode") {
                 let e = py_int(flags.val_or("--episode", ""));
