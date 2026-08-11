@@ -3,8 +3,8 @@
 //! Dispatch mirrors arr.py's main(): `arr <svc> <cmd> ...` for the arr
 //! services, plus the sab/jellyfin/seerr/bazarr command families and the
 //! top-level `arr delete` / `arr queue` conveniences. Output strings, flags
-//! and exit codes are parity-critical: Hermes' skills and cron watchdogs
-//! parse them.
+//! and exit codes have parsers (Hermes' skills and cron watchdogs) — evolve
+//! them additively; grep `skills/` before rewording existing lines.
 
 use arr_api::die;
 
@@ -122,6 +122,8 @@ pub fn run_svc_command(svc: &str, cmd: &str, args: &[String]) {
                 "stuck" => acquire::cmd_stuck(svc, args),
                 "episodes" => browse::cmd_episodes(svc, args),
                 "wait" => browse::cmd_wait(svc, args),
+                "searches" => browse::cmd_searches(svc, args),
+                "cancel" => browse::cmd_cancel(svc, args),
                 "history" => browse::cmd_history(svc, args),
                 "wanted" => browse::cmd_wanted(svc, args),
                 "parse" => browse::cmd_parse(svc, args),

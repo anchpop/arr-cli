@@ -19,8 +19,10 @@ This repo is the **source of truth** for both binaries. Edit, then build —
     CARGO_HOME=/data/hermes/.cargo cargo build --release   # hermes
 
 A daemon change also needs `systemctl restart download-notifier` (hermes has a
-polkit grant). Read `PORTING.md` before touching output formats — strings,
-flags and exit codes are parsed by skills and crons.
+polkit grant). Output strings, flags and exit codes have parsers — Hermes'
+skills (`skills/` here) and its crons. Adding new lines/verbs/flags is always
+fine; before rewording or removing *existing* output, grep those consumers for
+the string (see "Output compatibility" in `DEVELOPMENT.md`).
 
 **After any change, commit AND push** — nothing else version-controls it:
 

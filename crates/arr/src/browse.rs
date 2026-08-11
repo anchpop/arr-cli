@@ -1,7 +1,7 @@
 //! browse.rs — read-mostly commands: tag, status, get, seasons, releases,
 //! monitor, queue, wait, episodes, history, wanted, raw, parse, search.
-//! Faithful port of the corresponding arr.py functions; output strings, flags
-//! and exit codes are parity-critical.
+//! Output strings, flags and exit codes have parsers (Hermes' skills and
+//! crons) — evolve them additively; grep `skills/` before rewording.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arr_api::env::env_file_path;
 use arr_api::http::form_encode;
+use arr_api::http::{try_api, ApiError};
 use arr_api::{api, api_t, die, fmt_gb, mb, pop_flags, resolve_id, Flags, JsonExt, SAB_PORT};
 use serde_json::{json, Value};
 
@@ -248,35 +249,56 @@ pub fn audio_match(title: &str, lang: &str) -> bool {
 // it works for people with no Jellyfin account.
 
 pub fn ensure_tag(svc: &str, label: &str) -> i64 {
-    let tags = api(svc, "GET", "/tag", None).unwrap_or(Value::Null);
+    try_ensure_tag(svc, label).unwrap_or_else(|e| die(&e))
+}
+
+fn try_ensure_tag(svc: &str, label: &str) -> Result<i64, String> {
+    let err = |m: &str, e: &ApiError| crate::acquire::api_err_msg(m, "/tag", 120, e);
+    let tags = try_api(svc, "GET", "/tag", None, 120)
+        .map_err(|e| err("GET", &e))?
+        .unwrap_or(Value::Null);
     if let Some(arr) = tags.as_array() {
         for t in arr {
             if t.s("label").to_lowercase() == label.to_lowercase() {
-                return t.i("id");
+                return Ok(t.i("id"));
             }
         }
     }
-    api(svc, "POST", "/tag", Some(&json!({ "label": label })))
-        .map(|v| v.i("id"))
-        .unwrap_or(0)
+    try_api(svc, "POST", "/tag", Some(&json!({ "label": label })), 120)
+        .map_err(|e| err("POST", &e))
+        .map(|v| v.map(|v| v.i("id")).unwrap_or(0))
 }
 
 /// Add/remove one tag label on a series/movie via the editor endpoint.
 pub fn stamp_label(svc: &str, item_id: i64, label: &str, remove: bool) -> &'static str {
+    try_stamp_label(svc, item_id, label, remove).unwrap_or_else(|e| die(&e))
+}
+
+/// Fallible stamp_label — for `add`, where a failed tag must not abort the
+/// wait-and-report half of the command (a half-done add whose caller can't
+/// tell which half happened is the worst shape for the agent).
+pub fn try_stamp_label(
+    svc: &str,
+    item_id: i64,
+    label: &str,
+    remove: bool,
+) -> Result<&'static str, String> {
     let (coll, ids_field) = if svc.starts_with("sonarr") {
         ("series", "seriesIds")
     } else if svc == "radarr" {
         ("movie", "movieIds")
     } else {
-        die("tag: only sonarr/sonarr-anime/radarr have taggable items")
+        return Err("tag: only sonarr/sonarr-anime/radarr have taggable items".into());
     };
-    let tag_id = ensure_tag(svc, label);
+    let tag_id = try_ensure_tag(svc, label)?;
     let mut body = serde_json::Map::new();
     body.insert(ids_field.to_string(), json!([item_id]));
     body.insert("tags".to_string(), json!([tag_id]));
     body.insert("applyTags".to_string(), json!(if remove { "remove" } else { "add" }));
-    api(svc, "PUT", &format!("/{}/editor", coll), Some(&Value::Object(body)));
-    coll
+    let path = format!("/{}/editor", coll);
+    try_api(svc, "PUT", &path, Some(&Value::Object(body)), 120)
+        .map_err(|e| crate::acquire::api_err_msg("PUT", &path, 120, &e))?;
+    Ok(coll)
 }
 
 pub fn tag_requester(svc: &str, query: &str, discord_id: &str, remove: bool) -> (String, i64, String) {
@@ -880,6 +902,216 @@ pub fn wait_command(svc: &str, cmd_id: i64, timeout: f64) -> Value {
 
 /// Block until an arr command (search/grab/import/refresh/rename) finishes.
 ///
+// --- search-command inspection ------------------------------------------------
+// The arrs run searches as background "commands" (GET /command); a slow indexer
+// can keep a SeriesSearch grinding per-episode for an hour+. These helpers make
+// that state visible/controllable so nobody has to hand-poll the API with curl.
+
+/// Parse "YYYY-MM-DDTHH:MM:SS[.fff]Z" → unix seconds. Inverse of policy's
+/// utc_iso (Hinnant days_from_civil). None on anything unparsable.
+pub fn iso_epoch(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r).and_then(|t| t.parse::<i64>().ok());
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + sec)
+}
+
+pub fn fmt_age(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{}s", s)
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h{:02}m", s / 3600, (s % 3600) / 60)
+    }
+}
+
+/// Search-type commands from GET /command (the arrs keep recently-finished
+/// ones listed for a few minutes), newest first. `item_id` filters to one
+/// series/movie via the command body; EpisodeSearch commands carry only
+/// episode ids, so they only appear in the unfiltered listing.
+pub fn search_commands(svc: &str, item_id: Option<i64>) -> Vec<Value> {
+    let cmds = api(svc, "GET", "/command", None).unwrap_or(Value::Null);
+    let mut v: Vec<Value> = cmds
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.s("name").ends_with("Search"))
+        .filter(|c| match item_id {
+            None => true,
+            Some(id) => {
+                let b = c.at(&["body"]);
+                b.i("seriesId") == id
+                    || b.a("movieIds").iter().any(|m| m.as_i64() == Some(id))
+            }
+        })
+        .collect();
+    v.sort_by_key(|c| std::cmp::Reverse(c.i("id")));
+    v
+}
+
+/// One display line per command: id, name, state, age, live message.
+/// A search that's been running >15m gets a ⚠ — with healthy indexers even a
+/// full per-episode series sweep finishes well inside that.
+pub fn search_command_line(c: &Value, now: i64) -> String {
+    let st = c.s("status");
+    let (stamp, verb) = match st {
+        "started" => (c.s("started"), "running"),
+        "queued" => (c.s("queued"), "queued"),
+        _ => (c.s("ended"), st),
+    };
+    let age = iso_epoch(stamp).map(|t| fmt_age(now - t)).unwrap_or_default();
+    let warn = if st == "started" && iso_epoch(c.s("started")).map_or(false, |t| now - t > 900) {
+        " ⚠"
+    } else {
+        ""
+    };
+    let msg = c.s("message");
+    format!(
+        "#{} {} {} {}{}{}",
+        c.i("id"),
+        c.s("name"),
+        verb,
+        age,
+        warn,
+        if msg.is_empty() { String::new() } else { format!(" — {}", msg) }
+    )
+}
+
+/// arr <svc> searches [id|query] — the arr's active/recent search commands.
+/// Answers "is the search still going / where is it / is it stuck?" after a
+/// grab/add reports nothing landed yet.
+pub fn cmd_searches(svc: &str, args: &[String]) {
+    let (_flags, rest) = pop_flags(args, &[]);
+    let item_id = rest.first().map(|q| crate::disk::resolve_soft(svc, q))
+        .transpose()
+        .unwrap_or_else(|e| die(&e));
+    let cmds = search_commands(svc, item_id);
+    if cmds.is_empty() {
+        println!(
+            "no active or recent search commands{} on {} (finished ones drop off the list after a few minutes)",
+            item_id.map(|i| format!(" for item {}", i)).unwrap_or_default(),
+            svc
+        );
+        return;
+    }
+    let now = now_epoch();
+    for c in &cmds {
+        println!("{}", search_command_line(c, now));
+    }
+    if cmds.iter().any(|c| c.s("status") == "queued") {
+        println!("  (a QUEUED command can be cancelled: arr {} cancel <id>)", svc);
+    }
+    if cmds.iter().any(|c| c.s("status") == "started") {
+        println!(
+            "  (a STARTED command runs to completion — the arrs can't cancel it; a narrower search runs in parallel, e.g. arr {} grab <id> --season N)",
+            svc
+        );
+    }
+}
+
+/// arr <svc> cancel <commandId...> — cancel QUEUED arr commands
+/// (DELETE /command/{id}). The arrs refuse to cancel a command that has
+/// already STARTED executing (HTTP 409) — those run to completion; the move
+/// then is to fire a narrower search alongside (searches run in parallel).
+pub fn cmd_cancel(svc: &str, args: &[String]) {
+    let (_flags, rest) = pop_flags(args, &[]);
+    if rest.is_empty() {
+        die("cancel: need command id(s) — see `arr <svc> searches`");
+    }
+    let mut failed = false;
+    for id_s in &rest {
+        let id: i64 = id_s
+            .parse()
+            .unwrap_or_else(|_| die(&format!("cancel: bad command id '{}' (see `arr {} searches`)", id_s, svc)));
+        let before = api(svc, "GET", &format!("/command/{}", id), None).unwrap_or(Value::Null);
+        match try_api(svc, "DELETE", &format!("/command/{}", id), None, 120) {
+            Ok(_) => println!(
+                "cancelled #{} {} (was {})",
+                id,
+                before.s("name"),
+                py_get(&before, "status")
+            ),
+            Err(ApiError::Http { code: 409, .. }) => {
+                failed = true;
+                println!(
+                    "can't cancel #{} {} — it already STARTED ({}), and the arrs only cancel queued commands. It will finish on its own; a narrower search can run in parallel meanwhile (e.g. grab --season N)",
+                    id,
+                    before.s("name"),
+                    py_get(&before, "status")
+                );
+            }
+            Err(e) => {
+                failed = true;
+                println!(
+                    "FAILED to cancel #{}: {}",
+                    id,
+                    crate::acquire::api_err_msg("DELETE", &format!("/command/{}", id), 120, &e)
+                );
+            }
+        }
+    }
+    if failed {
+        std::process::exit(1);
+    }
+}
+
+pub fn now_epoch() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// One-line indexer-health summary from Prowlarr's /indexerstatus (per-indexer
+/// failure backoff): "3/4 prowlarr indexers backed off (Nyaa 34m left, …)".
+/// This is the difference between "releases are scarce" and "the indexers are
+/// down" — the diagnosis a bare zero-grab can't make. Prowlarr is the source
+/// because every arr indexer here is Prowlarr-proxied and the arrs themselves
+/// don't expose /indexerstatus (404 on sonarr/radarr v4).
+/// None when Prowlarr isn't reachable (diagnosis must never break flow).
+pub fn indexer_backoff_line() -> Option<String> {
+    let idx = try_api("prowlarr", "GET", "/indexer", None, 30).ok()??;
+    let enabled: HashMap<i64, String> = idx
+        .as_array()?
+        .iter()
+        .filter(|i| i.b("enable"))
+        .map(|i| (i.i("id"), i.s("name").to_string()))
+        .collect();
+    if enabled.is_empty() {
+        return Some("prowlarr has NO enabled indexers — searches can't find anything".into());
+    }
+    let status = try_api("prowlarr", "GET", "/indexerstatus", None, 30).ok()??;
+    let now = now_epoch();
+    let mut off: Vec<String> = vec![];
+    for s in status.as_array()? {
+        let Some(name) = enabled.get(&s.i("indexerId")) else { continue };
+        if let Some(t) = iso_epoch(s.s("disabledTill")) {
+            if t > now {
+                off.push(format!("{} {} left", name, fmt_age(t - now)));
+            }
+        }
+    }
+    Some(if off.is_empty() {
+        format!("all {} prowlarr indexers healthy (no failure backoff)", enabled.len())
+    } else {
+        format!(
+            "{}/{} prowlarr indexers backed off after failures ({})",
+            off.len(),
+            enabled.len(),
+            off.join(", ")
+        )
+    })
+}
+
 /// arr <svc> wait <commandId> [--timeout SECONDS]
 /// Command ids come from `grab`, `import`, or any `raw POST /command`. Exits
 /// non-zero unless the command reached 'completed'.

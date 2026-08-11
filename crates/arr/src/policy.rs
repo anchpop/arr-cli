@@ -804,6 +804,37 @@ fn do_add(
 }
 
 /// Add a series/movie by title — strict disambiguation, sane defaults.
+/// Stamp `add`'s requester/require-* tags without letting a failure abort the
+/// command: the series/movie already exists at this point, and the
+/// wait-and-report step after us is the half the caller actually asked for.
+/// On failure, print the exact rerun command instead of dying.
+fn stamp_add_tags(svc: &str, item_id: i64, flags: &Flags) {
+    if let Some(req) = flags.val("--requester") {
+        let req = req.trim();
+        match crate::browse::try_stamp_label(svc, item_id, &format!("requester-{}", req), false) {
+            Ok(_) => println!("  tagged requester:{} (download-notifier will DM them)", req),
+            Err(e) => println!(
+                "  ⚠ requester tag failed ({}) — rerun: arr {} tag {} --requester {}",
+                e, svc, item_id, req
+            ),
+        }
+    }
+    for lab in crate::browse::require_labels(flags) {
+        match crate::browse::try_stamp_label(svc, item_id, &lab, false) {
+            Ok(_) => println!("  tagged {} (the ✅ ready DM will verify it via ffprobe)", lab),
+            Err(e) => println!(
+                "  ⚠ {} tag failed ({}) — rerun: arr {} tag {} --{} {}",
+                lab,
+                e,
+                svc,
+                item_id,
+                if lab.starts_with("require-subs") { "require-subs" } else { "require-audio" },
+                lab.rsplit('-').next().unwrap_or("eng")
+            ),
+        }
+    }
+}
+
 pub fn cmd_add(svc: &str, args: &[String]) {
     if !(svc.starts_with("sonarr") || svc == "radarr") {
         die("add: sonarr/sonarr-anime/radarr only");
@@ -828,6 +859,13 @@ pub fn cmd_add(svc: &str, args: &[String]) {
     if rest.is_empty() {
         die("add: need a title");
     }
+    // Reject a malformed --requester up front — dying after the add has
+    // already mutated the library is the half-done shape we never want.
+    if let Some(r) = flags.val("--requester") {
+        if r.trim().is_empty() || !r.trim().chars().all(|c| c.is_ascii_digit()) {
+            die(&format!("add: --requester must be a numeric Discord user id (got '{}')", r));
+        }
+    }
     let term = rest.join(" ");
     let is_series = svc.starts_with("sonarr");
     let tvdb = flags.val("--tvdb").map(|v| parse_int_flag(v, "--tvdb")).unwrap_or(0);
@@ -848,14 +886,7 @@ pub fn cmd_add(svc: &str, args: &[String]) {
             existing.s("title"),
             py_get(&existing, "year")
         );
-        if let Some(req) = flags.val("--requester") {
-            let _ = crate::browse::tag_requester(svc, &existing.i("id").to_string(), req, false);
-            println!("  tagged requester:{}", req);
-        }
-        for lab in crate::browse::require_labels(&flags) {
-            crate::browse::stamp_label(svc, existing.i("id"), &lab, false);
-            println!("  tagged {} (notifier verifies at ready-time)", lab);
-        }
+        stamp_add_tags(svc, existing.i("id"), &flags);
         if is_series {
             let (_, rows) = series_coverage(svc, existing.i("id"), None);
             let (fixable, askable) = coverage_print(&rows);
@@ -935,14 +966,7 @@ pub fn cmd_add(svc: &str, args: &[String]) {
         flags.val("--root"),
         !flags.has("--no-search"),
     );
-    if let Some(req) = flags.val("--requester") {
-        let _ = crate::browse::tag_requester(svc, &created.i("id").to_string(), req, false);
-        println!("  tagged requester:{} (download-notifier will DM them)", req);
-    }
-    for lab in crate::browse::require_labels(&flags) {
-        crate::browse::stamp_label(svc, created.i("id"), &lab, false);
-        println!("  tagged {} (the ✅ ready DM will verify it via ffprobe)", lab);
-    }
+    stamp_add_tags(svc, created.i("id"), &flags);
     // By default, hang around briefly and report what the search actually
     // grabbed — so a single `add` answers "is it downloading?" without
     // status/history/queue follow-up calls.

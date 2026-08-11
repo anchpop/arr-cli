@@ -1,7 +1,7 @@
 //! Seerr / Jellyfin / Bazarr command families (port of arr.py lines 3077-3353).
 //!
-//! Output strings are parity-critical — Hermes' skills and Andre's muscle
-//! memory parse them. Python renders absent fields as "None" via `%s`; the
+//! Output strings have parsers — Hermes' skills and Andre's muscle memory;
+//! evolve additively. Python renders absent fields as "None" via `%s`; the
 //! `py_str` helper reproduces that, and `py_dumps` reproduces
 //! `json.dumps(..., indent=2)` (ensure_ascii escaping included).
 

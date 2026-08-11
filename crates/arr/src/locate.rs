@@ -125,6 +125,7 @@ pub fn is_item_command(cmd: &str) -> bool {
             | "tag"
             | "coverage"
             | "tracks"
+            | "searches"
     )
 }
 
@@ -334,6 +335,29 @@ pub fn cmd_where(args: &[String]) {
             } else {
                 println!("  disk       no file");
                 next.push(format!("arr {} grab {}", h.svc, it.i("id")));
+            }
+        }
+    }
+
+    // --- active searches --- (a grinding SeriesSearch is invisible in the
+    // queue — without this line "arr queue: nothing downloading" reads as
+    // "nothing is happening" while the arr is mid-search)
+    if let Some(h) = &hit {
+        let active: Vec<Value> = browse::search_commands(h.svc, Some(h.item.i("id")))
+            .into_iter()
+            .filter(|c| matches!(c.s("status"), "started" | "queued"))
+            .collect();
+        if !active.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            for (i, c) in active.iter().enumerate() {
+                println!(
+                    "  {}{}",
+                    if i == 0 { "search     " } else { "           " },
+                    browse::search_command_line(c, now)
+                );
             }
         }
     }

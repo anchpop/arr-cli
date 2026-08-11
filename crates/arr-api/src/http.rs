@@ -76,6 +76,12 @@ pub fn form_encode(params: &[(&str, &str)]) -> String {
 }
 
 /// Fallible arr call (radarr/sonarr/sonarr-anime/prowlarr).
+///
+/// A 5xx "database is locked" (SQLite Busy — near-guaranteed right after an
+/// add-with-search, while the arr writes the episode rows) is transient, so
+/// it's absorbed here with a bounded backoff instead of surfacing to every
+/// caller as a hard failure. The statement that got Busy did not execute, so
+/// retrying mutations is safe.
 pub fn try_api(
     svc: &str,
     method: &str,
@@ -86,8 +92,23 @@ pub fn try_api(
     let (port, ver, _) = crate::svc_cfg(svc)
         .unwrap_or_else(|| die(&format!("unknown service '{}'", svc)));
     let url = format!("http://localhost:{}/api/{}{}", port, ver, path);
-    let req = agent().request(method, &url).set("X-Api-Key", &get_key(svc));
-    run(req, body, timeout)
+    let mut delay = 2u64;
+    loop {
+        let req = agent().request(method, &url).set("X-Api-Key", &get_key(svc));
+        match run(req, body, timeout) {
+            Err(ApiError::Http { code, ref detail })
+                if code >= 500 && detail.contains("database is locked") && delay <= 16 =>
+            {
+                eprintln!(
+                    "arr: {} database busy — retrying {} {} in {}s",
+                    svc, method, path, delay
+                );
+                std::thread::sleep(Duration::from_secs(delay));
+                delay *= 2; // 2+4+8+16 = 30s of patience, then give up
+            }
+            other => return other,
+        }
+    }
 }
 
 /// Die-on-error arr call with arr.py's exact messages. Default timeout 120s.

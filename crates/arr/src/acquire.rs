@@ -94,7 +94,7 @@ fn urlquote(s: &str) -> String {
 /// The exact message api()/api_t() would die with — for call sites where the
 /// Python catches SystemExit (die() has already printed, then execution
 /// continues), we print the same line to stderr and carry on.
-fn api_err_msg(method: &str, path: &str, timeout: u64, e: &ApiError) -> String {
+pub fn api_err_msg(method: &str, path: &str, timeout: u64, e: &ApiError) -> String {
     match e {
         ApiError::Http { code, detail } => {
             format!("{} {} -> HTTP {} {}", method, path, code, detail)
@@ -452,6 +452,8 @@ fn movie_id_of(r: &Value) -> i64 {
 /// grabs get promoted to the front of the download queue.
 pub fn report_first_grab(svc: &str, iid: i64, is_series: bool, timeout: i64) -> bool {
     let start = Instant::now();
+    // command id -> its message when first observed (progress yardstick)
+    let mut seen_searches: HashMap<i64, String> = HashMap::new();
     loop {
         let q = queue_records_caught(svc, 1000).unwrap_or_default();
         let mine: Vec<&Value> = q
@@ -482,14 +484,76 @@ pub fn report_first_grab(svc: &str, iid: i64, is_series: bool, timeout: i64) -> 
             promote_downloads(&owned);
             return true;
         }
+        // Narrate the search commands doing the actual work: print each one
+        // as it appears (with its id, so `wait`/`cancel` are reachable), and
+        // remember its first message to measure progress at timeout.
+        let now = crate::browse::now_epoch();
+        for c in crate::browse::search_commands(svc, Some(iid)) {
+            if !matches!(c.s("status"), "started" | "queued") {
+                continue;
+            }
+            let id = c.i("id");
+            seen_searches.entry(id).or_insert_with(|| {
+                println!("  search: {}", crate::browse::search_command_line(&c, now));
+                c.s("message").to_string()
+            });
+        }
         if start.elapsed().as_secs_f64() > timeout as f64 {
-            println!(
-                "  nothing grabbed in {}s — the search may still be running (indexers can be slow) or releases are scarce. `arr {} queue` shows late grabs; `arr {} releases {}` shows candidates with reject reasons",
-                timeout, svc, svc, iid
-            );
+            report_empty_wait(svc, iid, timeout, &seen_searches);
             return false;
         }
         std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// The wait expired with nothing in the queue. Say WHY as far as the APIs can
+/// tell — "search still grinding with dead indexers" and "search finished,
+/// releases scarce" need opposite responses, and a bare "nothing grabbed"
+/// leaves the caller polling /command by hand to tell them apart.
+fn report_empty_wait(svc: &str, iid: i64, timeout: i64, first_msgs: &HashMap<i64, String>) {
+    let now = crate::browse::now_epoch();
+    let active: Vec<Value> = crate::browse::search_commands(svc, Some(iid))
+        .into_iter()
+        .filter(|c| matches!(c.s("status"), "started" | "queued"))
+        .collect();
+    if active.is_empty() {
+        println!(
+            "  nothing grabbed in {}s and no search is still running — the search finished empty-handed.",
+            timeout
+        );
+        if let Some(line) = crate::browse::indexer_backoff_line() {
+            println!("  {}", line);
+        }
+        println!(
+            "  releases scarce or all rejected: `arr {} releases {}` lists candidates with reject reasons",
+            svc, iid
+        );
+        return;
+    }
+    println!("  nothing grabbed in {}s — the search is still running:", timeout);
+    for c in &active {
+        println!("    {}", crate::browse::search_command_line(c, now));
+        if let Some(first) = first_msgs.get(&c.i("id")) {
+            if !first.is_empty() && first == c.s("message") {
+                println!(
+                    "      ↳ no visible progress during the {}s wait — indexer queries may be timing out",
+                    timeout
+                );
+            }
+        }
+    }
+    if let Some(line) = crate::browse::indexer_backoff_line() {
+        println!("  {}", line);
+    }
+    println!("  check back: arr {} searches {}", svc, iid);
+    if svc.starts_with("sonarr") {
+        // A started command can't be cancelled (the arrs 409 on that) but
+        // searches run concurrently, so going narrower doesn't require
+        // waiting for the grinder to finish.
+        println!(
+            "  a narrower search can run alongside it: arr {} grab {} --season N",
+            svc, iid
+        );
     }
 }
 

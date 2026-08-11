@@ -19,10 +19,11 @@ sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
   (ids are only unique within one instance). Ambiguous titles list candidates.
 
   arr where <title>               WHERE IS THIS? one call, whole pipeline:
-        which service holds it, what's on disk (per-season for shows), what's
-        in the arr + SAB queues, the Seerr request state, whether Jellyfin can
-        see it, and the command that moves it forward. Start here for "is it
-        downloading?" / "why isn't X there?" instead of checking each service.
+        which service holds it, what's on disk (per-season for shows), any
+        search still running, what's in the arr + SAB queues, the Seerr request
+        state, whether Jellyfin can see it, and the command that moves it
+        forward. Start here for "is it downloading?" / "why isn't X there?"
+        instead of checking each service.
 
 Commands (sonarr & radarr unless noted):
   status [query]                  list items (optionally filter by title)
@@ -75,7 +76,11 @@ Commands (sonarr & radarr unless noted):
         [--wait] [--no-wait] [--monitor]
         no flags: search & let the arr decide (respects quality profile), then
         wait up to 60s and report what got grabbed (--no-wait skips; --timeout
-        adjusts). Fresh grabs — and anything already downloading for this item —
+        adjusts). The wait narrates the search command (id + live progress) and
+        a zero-grab timeout ends with a diagnosis — search still running vs
+        finished empty, indexer backoff state — plus searches/cancel follow-ups
+        (add's wait works the same).
+        Fresh grabs — and anything already downloading for this item —
         are promoted to the front of the queue, so this doubles as "I want this
         NOW" on something already in flight.
         Converges on the two states where a bare search achieves nothing:
@@ -100,6 +105,13 @@ Commands (sonarr & radarr unless noted):
   episodes <id|query> [--season N] [--missing] [--monitored] [--json]   (sonarr)
         list episodes WITH ids (for grab/import by --episode). --missing = no file
   wait <commandId> [--timeout SECS]   block until a search/grab/import/refresh ends
+  searches [id|query]             active/recent search commands: id, age, live
+        progress message, ⚠ when one has been grinding >15m. THE follow-up
+        when grab/add reports nothing landed — is the search alive, and where?
+  cancel <commandId...>           cancel QUEUED commands. A STARTED command
+        runs to completion (the arrs 409 on cancelling it) — but searches run
+        concurrently, so fire a narrower one alongside a grinder instead:
+        `grab <id> --season N`
   monitor <id|query> <spec>       sonarr: all|none|s1,s2,...   radarr: on|off
   info <id|query>                 concise identity (title/year/ids/origTitle/altTitles/state)
   lookup <term>                   TMDB/TVDB metadata search (disambiguate 1990 vs 2003)

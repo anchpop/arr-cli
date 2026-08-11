@@ -1,10 +1,23 @@
 # Developing the arr stack
 
 This repo is the source of truth for the media-stack *tooling layer*: the `arr`
-CLI (`arr.py`) and the Hermes operating skills (`skills/<name>/SKILL.md`,
-symlinked into `~/.hermes/skills/media/` by the nixos `arrRepo` activation).
+CLI (`crates/arr`; `arr.py` is the frozen bootstrap fallback) and the Hermes
+operating skills (`skills/<name>/SKILL.md`, symlinked into
+`~/.hermes/skills/media/` by the nixos `arrRepo` activation).
 Always commit **and** push after editing — nothing else version-controls these
 files, and a fresh `/data` re-clones from GitHub.
+
+## Output compatibility
+
+Printed output and exit codes have non-human readers: Hermes' skills
+(`skills/` in this repo) and its crons/webhook wake prompts parse them. The
+rule is additive evolution — new verbs, new flags, and extra lines appended to
+existing output are always safe, and generous output is a feature (the agent
+reads fast and skips what it doesn't need; understanding *what a command did
+and why* is most of the agent experience). Before rewording or removing an
+existing line, or changing an exit code, grep `skills/` and the Hermes cron
+definitions for the string. (The strict byte-parity rules from the 2026-07
+Python→Rust port are retired — the port is done and `PORTING.md` is deleted.)
 
 ## The one-commit rule
 
@@ -12,7 +25,7 @@ A tool change and the skill prose describing it belong in the same commit.
 The skills are the tools' operating manual; every time they drift apart, the
 agent faithfully executes stale instructions (it once re-derived a whole
 add-verification workflow by hand because the skill predated `add`'s
-wait-and-report default). When you change `arr.py` behavior, grep `skills/`
+wait-and-report default). When you change CLI behavior, grep `skills/`
 for the old behavior before committing.
 
 ## Audience split
