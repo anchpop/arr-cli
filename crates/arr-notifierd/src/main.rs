@@ -22,8 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::arrs::{
-    aggregate_queue, arr_get, err_str, fetch_item, jf_has_movie, jf_series_episode_count,
-    seerr_get, trigger_jellyfin_scan, Group,
+    aggregate_queue, arr_get, episode_hasfile_map, err_str, fetch_item, jf_has_movie,
+    jf_series_episode_count, seerr_get, trigger_jellyfin_scan, Group,
 };
 use crate::config::{
     cfg, DONE_THRESHOLD, FAIL_STALL_WINDOW, FAIL_WAKE_THRESHOLD, JF_CONFIRM_TIMEOUT,
@@ -31,7 +31,7 @@ use crate::config::{
     VERIFY_RECHECK_WINDOW,
 };
 use crate::discord::{edit_message, send_message, send_via_thread};
-use crate::embeds::{build_embed, render_chart};
+use crate::embeds::{build_embed, render_chart, watchable, SeasonLine};
 use crate::util::{log, now, py_round, scalar_str, split_key};
 use crate::verify::{bazarr_kick, dv5_warning, verify_language, wake_hermes, wake_hermes_failed};
 
@@ -182,10 +182,13 @@ fn evolve_attempts(
     (attempts, dlids)
 }
 
-/// Per-episode status for the season chart: episodes in the queue are
-/// downloading/importing; ones that have left are resolved via Sonarr's
-/// hasFile (present ⇒ done ✅, absent ⇒ failed ❌). Accumulates so finished
-/// episodes stay.
+/// Per-episode status for the season chart. An episode in the queue that
+/// Sonarr already has a file for is a quality *upgrade* — the requester can
+/// watch it right now — so it renders 🔁 and counts as done instead of
+/// masquerading as a fresh download (a 146GB remux upgrade once made 24
+/// watchable episodes show ⏳ for a day). Fresh in-queue episodes keep their
+/// queue state; departed ones resolve via hasFile (present ⇒ done ✅,
+/// absent ⇒ failed ❌). Accumulates so finished episodes stay.
 fn compute_ep_status(
     instn: &str,
     iid: &str,
@@ -195,25 +198,28 @@ fn compute_ep_status(
     let mut ep_status = stored.clone();
     let empty = BTreeMap::new();
     let in_queue = g.map(|g| &g.ep_state).unwrap_or(&empty);
+    let hasfile = episode_hasfile_map(instn, iid);
     for (k, st) in in_queue {
-        ep_status.insert(k.clone(), st.clone());
+        let newst = match &hasfile {
+            Some(m) if m.get(k).copied().unwrap_or(false) => "upgrading".to_string(),
+            Some(_) => st.clone(),
+            // episode fetch failed: keep an existing 'upgrading' rather than
+            // regressing a watchable episode to ⏳ for one API blip
+            None if ep_status.get(k).is_some_and(|s| s.as_str() == "upgrading") => continue,
+            None => st.clone(),
+        };
+        ep_status.insert(k.clone(), newst);
     }
-    let departed: Vec<String> = ep_status
-        .keys()
-        .filter(|k| !in_queue.contains_key(*k))
-        .cloned()
-        .collect();
-    if !departed.is_empty() {
-        let eps = arr_get(instn, &format!("episode?seriesId={}", iid)).unwrap_or(Value::Null);
-        let mut hasfile: HashMap<String, bool> = HashMap::new();
-        for e in eps.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
-            hasfile.insert(
-                format!("{}x{}", e.i("seasonNumber"), e.i("episodeNumber")),
-                e.b("hasFile"),
-            );
-        }
+    if let Some(m) = &hasfile {
+        // only resolve departures when the episode list actually loaded — a
+        // failed fetch must not mark everything ❌
+        let departed: Vec<String> = ep_status
+            .keys()
+            .filter(|k| !in_queue.contains_key(*k))
+            .cloned()
+            .collect();
         for k in departed {
-            let st = if hasfile.get(&k).copied().unwrap_or(false) {
+            let st = if m.get(&k).copied().unwrap_or(false) {
                 "done"
             } else {
                 "failed"
@@ -222,6 +228,45 @@ fn compute_ep_status(
         }
     }
     ep_status
+}
+
+/// Seasons that should render as a byte bar: every known episode of the
+/// season is in flight from exactly ONE download (a season pack). Seasons
+/// with mixed states or per-episode downloads keep the per-episode glyphs.
+fn season_bar_lines(
+    g: &Group,
+    ep_status: &BTreeMap<String, String>,
+) -> BTreeMap<i64, SeasonLine> {
+    let mut out = BTreeMap::new();
+    for (s, agg) in &g.seasons {
+        if agg.dlids.len() != 1 || agg.eps < 2 {
+            continue;
+        }
+        let prefix = format!("{}x", s);
+        let season_eps: Vec<&String> = ep_status
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        let uniform_inflight = season_eps.iter().all(|k| {
+            matches!(
+                ep_status.get(*k).map(|s| s.as_str()),
+                Some("downloading") | Some("importing")
+            )
+        });
+        if !uniform_inflight || season_eps.len() as i64 != agg.eps {
+            continue;
+        }
+        let size = if agg.size != 0.0 { agg.size } else { 1.0 };
+        let pct = py_round((size - agg.left) / size * 100.0).clamp(0, 100);
+        out.insert(
+            *s,
+            SeasonLine {
+                pct,
+                importing: agg.importing,
+            },
+        );
+    }
+    out
 }
 
 fn parse_attempts(s: Option<&str>) -> Vec<Value> {
@@ -278,6 +323,39 @@ fn handle(con: &Connection, key: &str, discord_id: &str, title: &str, g: &Group)
     };
     let (instn, iid_str) = split_key(key);
 
+    // Upgrade guard: a queue entry for something already fully on disk is a
+    // quality upgrade (a profile chasing e.g. a BD remux over an imported
+    // release). The requester can watch it right now, so a finished row is
+    // never regressed to 'downloading' and a fresh row never DMs — the
+    // upgrade runs to completion invisibly.
+    let phase = row.as_ref().and_then(|r| r.3.clone()).unwrap_or_default();
+    if row.is_none() || phase == "done" || phase == "importing" {
+        let already_watchable = if kind == "movie" {
+            matches!(fetch_item(&instn, "movie", &iid_str), Ok(Some(m)) if m.b("hasFile"))
+        } else {
+            !g.episodes.is_empty()
+                && episode_hasfile_map(&instn, &iid_str).is_some_and(|m| {
+                    g.episodes
+                        .iter()
+                        .all(|(s, e)| m.get(&format!("{}x{}", s, e)).copied().unwrap_or(false))
+                })
+        };
+        if already_watchable {
+            if row.is_none() {
+                let _ = con.execute(
+                    "INSERT INTO notified(key,discord_id,phase,kind,title,tmdb,imdb,tvdb,poster,year,updated_at) \
+                     VALUES(?,?,'done',?,?,?,?,?,?,?,?) ON CONFLICT(key) DO NOTHING",
+                    params![key, discord_id, kind, title, g.tmdb, g.imdb, g.tvdb, g.poster, g.year, now()],
+                );
+                log(&format!(
+                    "upgrade-only download for {:?} — already watchable, not DMing {}",
+                    title, discord_id
+                ));
+            }
+            return;
+        }
+    }
+
     // Multi-file (season grabbed as separate episode files) → per-episode chart;
     // single download (movie / season pack) → byte bar + attempts. Sticky once set.
     let stored_dlids: BTreeSet<String> = row
@@ -298,7 +376,43 @@ fn handle(con: &Connection, key: &str, discord_id: &str, title: &str, g: &Group)
     if multi {
         let stored_ep = parse_ep_status(row.as_ref().and_then(|r| r.6.as_deref()));
         let ep_status = compute_ep_status(&instn, &iid_str, Some(g), &stored_ep);
-        let chart = render_chart(&ep_status);
+        let season_bars = season_bar_lines(g, &ep_status);
+        let chart = render_chart(&ep_status, Some(&season_bars));
+        // Every episode already watchable (done or upgrading) ⇒ nothing the
+        // requester is actually waiting on: go straight to the Jellyfin
+        // confirm instead of holding the ✅ hostage to an upgrade's ETA.
+        if chart.total > 0 && ep_status.values().all(|s| watchable(s)) && mid.is_some() {
+            let payload = build_embed(
+                "adding",
+                title,
+                g.year,
+                g.poster.as_deref(),
+                &[],
+                "",
+                false,
+                Some(&chart),
+                None,
+            );
+            if !cfg().dry_run {
+                edit_message(cid.as_deref().unwrap_or(""), mid.as_deref().unwrap_or(""), &payload);
+            }
+            let _ = con.execute(
+                "UPDATE notified SET phase='importing', last_content=?, ep_status=?, \
+                 import_at=?, updated_at=? WHERE key=?",
+                params![
+                    serde_json::to_string(&payload).unwrap_or_default(),
+                    serde_json::to_string(&ep_status).unwrap_or_default(),
+                    now(),
+                    now(),
+                    key
+                ],
+            );
+            log(&format!(
+                "DM->{} all {} episodes watchable (rest is upgrades), awaiting Jellyfin: {}",
+                discord_id, chart.total, title
+            ));
+            return;
+        }
         total_eps = chart.total;
         pct = if chart.total != 0 {
             py_round(chart.done as f64 / chart.total as f64 * 100.0)
@@ -457,6 +571,17 @@ fn handle(con: &Connection, key: &str, discord_id: &str, title: &str, g: &Group)
         return;
     }
 
+    // Resurrected from a terminal state by NEW content (an upgrade would have
+    // returned in the guard above): re-baseline the Jellyfin episode count so
+    // 'ready' waits for the new episodes, not the old total.
+    if kind == "tv" && matches!(phase.as_str(), "done" | "failed") {
+        let b = jf_series_episode_count(&g.tvdb, &g.tmdb, &g.imdb);
+        let _ = con.execute(
+            "UPDATE notified SET jf_baseline=? WHERE key=?",
+            params![b, key],
+        );
+    }
+
     // Reuse the existing message. It's back in the queue, so it's (re)downloading —
     // flip phase back to 'downloading' (recovers from a flicker/failed that hit a
     // terminal state), reset the missing counter, refresh identity + attempts.
@@ -575,7 +700,7 @@ fn on_left_queue(con: &Connection, key: &str) {
         // season chart: resolve every episode (done vs failed) via hasFile
         let stored = parse_ep_status(ep_status_json.as_deref());
         let ep_status = compute_ep_status(&instn, &iid, None, &stored);
-        let chart = render_chart(&ep_status);
+        let chart = render_chart(&ep_status, None);
         if chart.done == 0 {
             // nothing actually imported — stay quiet
             log(&format!("season gone, 0/{} imported, no ping: {}", chart.total, title));
@@ -808,7 +933,7 @@ fn confirm_imported(con: &Connection) {
                 &[],
                 "",
                 false,
-                Some(&render_chart(&ep_status)),
+                Some(&render_chart(&ep_status, None)),
                 verify.as_deref(),
             )
         } else {
@@ -987,7 +1112,7 @@ fn recheck_verifications(con: &Connection) {
                     &[],
                     "",
                     false,
-                    Some(&render_chart(&ep_status)),
+                    Some(&render_chart(&ep_status, None)),
                     Some(&res.line),
                 )
             } else {

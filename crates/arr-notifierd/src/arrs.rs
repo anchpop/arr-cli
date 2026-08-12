@@ -308,7 +308,33 @@ pub struct Group {
     pub episodes: BTreeSet<(i64, i64)>,
     pub dlids: BTreeSet<String>,
     pub ep_state: BTreeMap<String, String>,
+    pub seasons: BTreeMap<i64, SeasonAgg>,
     pub pct: i64,
+}
+
+/// Per-season slice of the queue, so a season downloading as ONE download (a
+/// season pack) can render real byte progress instead of N identical glyphs.
+#[derive(Default)]
+pub struct SeasonAgg {
+    pub size: f64,
+    pub left: f64,
+    pub eps: i64,
+    pub importing: bool,
+    pub dlids: BTreeSet<String>,
+}
+
+/// "SxE" -> hasFile for every episode of a series. None on API error (the
+/// caller must not mistake a blip for "no files").
+pub fn episode_hasfile_map(instn: &str, iid: &str) -> Option<HashMap<String, bool>> {
+    let eps = arr_get(instn, &format!("episode?seriesId={}", iid))?;
+    let mut m = HashMap::new();
+    for e in eps.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        m.insert(
+            format!("{}x{}", e.i("seasonNumber"), e.i("episodeNumber")),
+            e.b("hasFile"),
+        );
+    }
+    Some(m)
 }
 
 /// internal_id -> aggregated download state. None on API error — distinct from
@@ -338,6 +364,7 @@ pub fn aggregate_queue(instn: &str) -> Option<BTreeMap<i64, Group>> {
             episodes: BTreeSet::new(),
             dlids: BTreeSet::new(),
             ep_state: BTreeMap::new(),
+            seasons: BTreeMap::new(),
             pct: 0,
         });
         if let Some(d) = rec.get("downloadId").and_then(|v| v.as_str()) {
@@ -395,6 +422,18 @@ pub fn aggregate_queue(instn: &str) -> Option<BTreeMap<i64, Group>> {
                     format!("{}x{}", s, e),
                     (if importing { "importing" } else { "downloading" }).to_string(),
                 );
+                let sa = g.seasons.entry(s).or_default();
+                sa.size += rec.f("size");
+                sa.left += rec.f("sizeleft");
+                sa.eps += 1;
+                if importing {
+                    sa.importing = true;
+                }
+                if let Some(d) = rec.get("downloadId").and_then(|v| v.as_str()) {
+                    if !d.is_empty() {
+                        sa.dlids.insert(d.to_string());
+                    }
+                }
             }
         }
         if g.title.as_deref().unwrap_or("").is_empty() {

@@ -1,6 +1,6 @@
-//! Discord embed rendering: progress bars ▰▱, per-episode charts ✅📥⏳❌,
-//! state colours. Rendered strings are what requesters see — keep them
-//! byte-identical to the Python.
+//! Discord embed rendering: progress bars ▰▱, per-episode charts ✅📥⏳❌🔁,
+//! state colours. Rendered strings are what requesters see — change them
+//! deliberately, and keep every state reachable from the selftest.
 
 use std::collections::BTreeMap;
 
@@ -89,15 +89,30 @@ fn embed_color(state: &str) -> i64 {
     }
 }
 
-// Per-episode status glyphs for the multi-file (season) chart.
+// Per-episode status glyphs for the multi-file (season) chart. "upgrading"
+// (🔁) means the episode is already on disk and watchable — the queue entry
+// is only a quality upgrade — so it counts as done everywhere.
 fn ep_emoji(st: &str) -> &'static str {
     match st {
         "done" => "✅",
+        "upgrading" => "🔁",
         "importing" => "📥",
         "downloading" => "⏳",
         "failed" => "❌",
         _ => "▫️",
     }
+}
+
+/// An episode the requester could watch right now.
+pub fn watchable(st: &str) -> bool {
+    st == "done" || st == "upgrading"
+}
+
+/// A season currently downloading as ONE download (season pack): rendered as
+/// its own byte bar instead of N copies of the same glyph.
+pub struct SeasonLine {
+    pub pct: i64,
+    pub importing: bool,
 }
 
 pub struct Chart {
@@ -107,7 +122,11 @@ pub struct Chart {
 }
 
 /// ep_status: {"<season>x<ep>": status} -> (lines grouped by season, done, total).
-pub fn render_chart(ep_status: &BTreeMap<String, String>) -> Chart {
+/// Seasons present in `season_bars` render as a byte bar; the rest as glyphs.
+pub fn render_chart(
+    ep_status: &BTreeMap<String, String>,
+    season_bars: Option<&BTreeMap<i64, SeasonLine>>,
+) -> Chart {
     let mut by_season: BTreeMap<i64, Vec<(i64, String)>> = BTreeMap::new();
     for (k, st) in ep_status {
         let mut it = k.split('x');
@@ -117,11 +136,20 @@ pub fn render_chart(ep_status: &BTreeMap<String, String>) -> Chart {
     }
     let mut lines = Vec::new();
     for (s, mut eps) in by_season {
+        if let Some(sl) = season_bars.and_then(|m| m.get(&s)) {
+            let tail = if sl.importing {
+                "📥 importing…".to_string()
+            } else {
+                format!("{}% — season pack", sl.pct)
+            };
+            lines.push(format!("S{}: {}  {}", s, render_bar(sl.pct), tail));
+            continue;
+        }
         eps.sort();
         let glyphs: String = eps.iter().map(|(_, st)| ep_emoji(st)).collect();
         lines.push(format!("S{}: {}", s, glyphs));
     }
-    let done = ep_status.values().filter(|st| st.as_str() == "done").count() as i64;
+    let done = ep_status.values().filter(|st| watchable(st)).count() as i64;
     Chart {
         lines,
         done,
