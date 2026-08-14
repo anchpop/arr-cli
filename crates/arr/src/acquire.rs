@@ -58,6 +58,79 @@ fn trunc(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Semantic media requirements carried by Sonarr/Radarr tags.  A plain
+/// `hasFile` is not enough to satisfy these: a completed language-recovery
+/// download may intentionally be a lower quality than the file it replaces.
+fn media_requirements(item: &Value, tag_labels: &HashMap<i64, String>) -> Vec<(String, String)> {
+    item.a("tags")
+        .iter()
+        .filter_map(|id| tag_labels.get(&id.as_i64().unwrap_or(0)))
+        .filter_map(|label| {
+            let label = label.to_lowercase();
+            label
+                .strip_prefix("require-audio-")
+                .map(|lang| ("audio".to_string(), crate::policy::norm_lang(lang)))
+                .or_else(|| {
+                    label
+                        .strip_prefix("require-subs-")
+                        .map(|lang| ("subs".to_string(), crate::policy::norm_lang(lang)))
+                })
+        })
+        .collect()
+}
+
+fn requirements_met(path: &str, requirements: &[(String, String)]) -> Option<bool> {
+    if requirements.is_empty() {
+        return Some(true);
+    }
+    let (audio, subs, readable) = crate::policy::file_tracks(path);
+    if !readable {
+        return None;
+    }
+    Some(requirements.iter().all(|(kind, lang)| match kind.as_str() {
+        "audio" => audio.iter().any(|track| track.lang == *lang),
+        "subs" => subs.iter().any(|track| track.lang == *lang),
+        _ => false,
+    }))
+}
+
+fn requirement_summary(requirements: &[(String, String)]) -> String {
+    requirements
+        .iter()
+        .map(|(kind, lang)| format!("{} {}", lang, kind))
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+#[cfg(test)]
+mod requirement_tests {
+    use super::*;
+
+    #[test]
+    fn parses_all_semantic_tags_and_ignores_requester() {
+        let item = json!({"tags": [1, 2, 3]});
+        let labels = HashMap::from([
+            (1, "require-audio-ko".to_string()),
+            (2, "require-subs-ENG".to_string()),
+            (3, "requester-123".to_string()),
+        ]);
+        assert_eq!(
+            media_requirements(&item, &labels),
+            vec![
+                ("audio".to_string(), "kor".to_string()),
+                ("subs".to_string(), "eng".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn chinese_track_aliases_match_chi_requirement() {
+        for alias in ["zh", "zho", "cmn", "yue", "chn"] {
+            assert_eq!(crate::policy::norm_lang(alias), "chi");
+        }
+    }
+}
+
 /// Python int(str) — die instead of a ValueError traceback.
 fn py_int(s: &str) -> i64 {
     s.trim()
@@ -983,6 +1056,14 @@ pub fn cmd_stuck(svc: &str, args: &[String]) {
         if go { "" } else { " [dry-run — pass --yes to apply]" }
     );
     let mut cleared_dl: HashSet<String> = HashSet::new();
+    let tag_labels: HashMap<i64, String> = if svc == "radarr" {
+        items(&api(svc, "GET", "/tag", None))
+            .iter()
+            .map(|t| (t.i("id"), t.s("label").to_string()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
     for r in &rows {
         let title = trunc(r.s("title"), 64);
         let state = ps(r, "trackedDownloadState");
@@ -1005,14 +1086,45 @@ pub fn cmd_stuck(svc: &str, args: &[String]) {
         // NB the episode/movie objects EMBEDDED in queue records are stale
         // snapshots — query live state.
         let mut satisfied = false;
+        let mut live_item = Value::Null;
+        let mut requirements: Vec<(String, String)> = Vec::new();
         if svc.starts_with("sonarr") && r.i("episodeId") != 0 {
             satisfied = api(svc, "GET", &format!("/episode/{}", r.i("episodeId")), None)
                 .map_or(false, |e| e.b("hasFile"));
         } else if svc == "radarr" {
             let mid = movie_id_of(r);
             if mid != 0 {
-                satisfied = api(svc, "GET", &format!("/movie/{}", mid), None)
-                    .map_or(false, |m| m.b("hasFile"));
+                live_item = api(svc, "GET", &format!("/movie/{}", mid), None)
+                    .unwrap_or(Value::Null);
+                satisfied = live_item.b("hasFile");
+                requirements = media_requirements(&live_item, &tag_labels);
+                if satisfied && !requirements.is_empty() {
+                    let mfid = live_item.i("movieFileId");
+                    let movie_file = if mfid != 0 {
+                        api(svc, "GET", &format!("/moviefile/{}", mfid), None)
+                            .unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    let existing_path = if !movie_file.s("path").is_empty() {
+                        movie_file.s("path").to_string()
+                    } else if !movie_file.s("relativePath").is_empty() {
+                        std::path::Path::new(live_item.s("path"))
+                            .join(movie_file.s("relativePath"))
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        String::new()
+                    };
+                    satisfied = !existing_path.is_empty()
+                        && requirements_met(&existing_path, &requirements) == Some(true);
+                    if !satisfied {
+                        println!(
+                            "  requirements: existing file does not verify {}; preserving replacement",
+                            requirement_summary(&requirements)
+                        );
+                    }
+                }
             }
         }
         if satisfied {
@@ -1072,7 +1184,11 @@ pub fn cmd_stuck(svc: &str, args: &[String]) {
                 );
                 continue;
             }
-            item = api(svc, "GET", &format!("/movie/{}", mid), None).unwrap_or(Value::Null);
+            item = if live_item.is_null() {
+                api(svc, "GET", &format!("/movie/{}", mid), None).unwrap_or(Value::Null)
+            } else {
+                live_item.clone()
+            };
             let (p, s) = plan_movie_import(&out, mid, "");
             payload = p;
             skipped = s;
@@ -1112,6 +1228,23 @@ pub fn cmd_stuck(svc: &str, args: &[String]) {
         }
         if !skipped.is_empty() {
             println!("    (skipped {} unmatched)", skipped.len());
+        }
+        if svc == "radarr" && !requirements.is_empty() {
+            let verified: Vec<&Value> = payload
+                .iter()
+                .filter(|p| requirements_met(p.s("path"), &requirements) == Some(true))
+                .collect();
+            if verified.len() != payload.len() {
+                println!(
+                    "  requirements: downloaded replacement does not verify {} (or ffprobe failed); left in client for review",
+                    requirement_summary(&requirements)
+                );
+                continue;
+            }
+            println!(
+                "  requirements: downloaded replacement verified {}",
+                requirement_summary(&requirements)
+            );
         }
         if go {
             prepare_target_dir(&item);
