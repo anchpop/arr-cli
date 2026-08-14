@@ -22,7 +22,10 @@ fn norm_lang(lang: &str) -> String {
         "fr" | "fra" => "fre",
         "de" | "deu" => "ger",
         "ko" => "kor",
-        "zh" | "zho" => "chi",
+        // Chinese discs tag audio any of zh/zho/chi/cmn (Mandarin)/yue
+        // (Cantonese)/chn; fold them all into "chi" so require-audio-chi
+        // matches whatever the release used (Better Days, 2026-08-14).
+        "zh" | "zho" | "cmn" | "yue" | "chn" => "chi",
         "es" => "spa",
         "it" => "ita",
         "pt" => "por",

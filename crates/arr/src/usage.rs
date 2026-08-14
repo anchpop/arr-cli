@@ -73,7 +73,7 @@ Commands (sonarr & radarr unless noted):
         (--audio: dub heuristic on release names — Dual Audio/English Dub/Multi;
          --timeout: raise past the 300s default — anime searches can exceed it)
   grab <id|query> [--season N|--episode EPID] [--override|--via-sab] [--dry-run]
-        [--wait] [--no-wait] [--monitor]
+        [--match SUBSTR] [--wait] [--no-wait] [--monitor]
         no flags: search & let the arr decide (respects quality profile), then
         wait up to 60s and report what got grabbed (--no-wait skips; --timeout
         adjusts). The wait narrates the search command (id + live progress) and
@@ -92,6 +92,12 @@ Commands (sonarr & radarr unless noted):
         which unmonitors every other season) and then searches.
         --override: force-push every candidate release (bypass rejections).
         --via-sab: send candidate NZBs straight to SAB (bypass search cache).
+        --match SUBSTR: with --override/--via-sab, push ONLY releases whose
+              title contains SUBSTR (case-insensitive) — the "grab THIS ONE
+              specific release from `releases`" verb. Never hand-roll
+              `raw POST /release` for this: the GUID-only push queues the job
+              while returning an empty-looking response, and re-pushing
+              double-queues it.
         --wait: also block until the search command itself finishes
         (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier

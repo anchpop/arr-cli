@@ -660,6 +660,7 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             ("--requester", 1),
             ("--no-wait", 0),
             ("--monitor", 0),
+            ("--match", 1),
         ],
     );
     if rest.is_empty() {
@@ -667,6 +668,13 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
     }
     let overridef = flags.has("--override");
     let dry = flags.has("--dry-run");
+    // --match targets ONE specific release from the candidate list (the thing
+    // that otherwise forces a raw POST /release, whose GUID-only quirk double-
+    // queues). It only makes sense on the push paths.
+    let matchf = flag_truthy(&flags, "--match").map(|m| m.to_lowercase());
+    if matchf.is_some() && !overridef && !flags.has("--via-sab") {
+        die("grab: --match picks a specific release from the candidates, which is a manual push — add --override (through the arr) or --via-sab (straight to SAB)");
+    }
 
     // Stamp the requester so the download-notifier DMs them with a progress bar.
     // Tagging the series/movie is branch-independent, so do it once up front.
@@ -700,6 +708,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             if r.s("protocol") != "usenet" || !truthy_key(r, "downloadUrl") {
                 continue;
             }
+            if let Some(m) = &matchf {
+                if !r.s("title").to_lowercase().contains(m.as_str()) {
+                    continue;
+                }
+            }
             let g = r.s("guid").to_string();
             if seen.contains(&g) {
                 continue;
@@ -714,6 +727,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             println!("{}{}", if ok { "added: " } else { "FAILED: " }, r.s("title"));
         }
         println!("({} usenet release(s) sent to SAB cat={})", n, svc);
+        if n == 0 {
+            if let Some(m) = &matchf {
+                println!("no candidate release matched '{}' — check the exact title with `arr {} releases`", m, svc);
+            }
+        }
         return;
     }
 
@@ -798,10 +816,15 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
         return;
     }
 
-    // --override: force-push every candidate release, bypassing rejections
-    println!(
-        "note: --override ignores every profile rejection (TRaSH scoring incl. upscale/LQ/BR-DISK protection) — worth a concrete reason"
-    );
+    // --override: force-push candidate releases, bypassing rejections
+    // (all of them, or just those whose title contains --match)
+    if matchf.is_some() {
+        println!("note: --override pushes past profile rejections — targeted at the --match release(s) only");
+    } else {
+        println!(
+            "note: --override ignores every profile rejection (TRaSH scoring incl. upscale/LQ/BR-DISK protection) — worth a concrete reason"
+        );
+    }
     let rels = api_t(
         svc,
         "GET",
@@ -812,6 +835,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut count = 0;
     for r in items(&rels) {
+        if let Some(m) = &matchf {
+            if !r.s("title").to_lowercase().contains(m.as_str()) {
+                continue;
+            }
+        }
         let g = r.s("guid").to_string();
         if seen.contains(&g) {
             continue;
@@ -837,6 +865,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
         }
     }
     println!("({} release(s) processed)", count);
+    if count == 0 {
+        if let Some(m) = &matchf {
+            println!("no candidate release matched '{}' — check the exact title with `arr {} releases`", m, svc);
+        }
+    }
 }
 
 // --- stuck (blocked-import repair) -------------------------------------------
