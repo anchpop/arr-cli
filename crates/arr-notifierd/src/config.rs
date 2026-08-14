@@ -26,6 +26,16 @@ pub const DONE_THRESHOLD: i64 = 95; // only treat a vanished download as finishe
 // "ready to watch" ping. If Jellyfin never confirms within this window we send
 // it anyway rather than stay silent.
 pub const JF_CONFIRM_TIMEOUT: f64 = 45.0 * 60.0;
+// Jellyfin can confirm freshly-imported episodes and then delete them again
+// minutes later: a new anime series' first scan can land episodes under a
+// virtual "Season Unknown" (AniDB episode data not fetched yet), and the
+// follow-up metadata refresh removes that season, cascading away every episode
+// AFTER we said "ready" (Girls' Last Tour, 2026-08-13). Keep re-checking
+// presence this long after ready; on regression, rescan (warm metadata caches
+// map the episodes correctly) and re-arm the confirmation, at most this many
+// times per item so a persistent Jellyfin problem can't flip-flop forever.
+pub const JF_REGRESSION_WINDOW: f64 = 60.0 * 60.0;
+pub const JF_REGRESSION_MAX: i64 = 2;
 // A download can briefly drop out of the arr queue without having actually
 // finished. Require it to be absent this many consecutive polls before we treat
 // it as "left the queue" — otherwise a flicker looks like completion and

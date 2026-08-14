@@ -264,6 +264,7 @@ pub fn cmd_where(args: &[String]) {
     // --- library ---
     let mut next: Vec<String> = vec![];
     let mut complete = false;
+    let mut disk_files: i64 = 0;
     match &hit {
         None => {
             println!("  library    not in radarr, sonarr or sonarr-anime");
@@ -312,6 +313,7 @@ pub fn cmd_where(args: &[String]) {
                 );
             }
             complete = aired > 0 && files >= aired;
+            disk_files = files;
             let gaps_mon = cov.iter().any(|c| c.season != 0 && c.monitored && !c.missing.is_empty());
             let gaps_unmon = cov.iter().any(|c| c.season != 0 && !c.monitored && c.files < c.aired);
             if gaps_mon {
@@ -327,6 +329,7 @@ pub fn cmd_where(args: &[String]) {
             let has = it.b("hasFile");
             complete = has;
             if has {
+                disk_files = 1;
                 println!(
                     "  disk       1 file, {}GB — {}",
                     fmt_gb(it.at(&["movieFile", "size"]).as_i64().unwrap_or(0)),
@@ -439,14 +442,32 @@ pub fn cmd_where(args: &[String]) {
             next.push(format!("arr jellyfin refresh --wait '{}'", title));
         }
     } else {
+        // A series item with ZERO episodes while the arr has files on disk means
+        // Jellyfin's scan dropped them (e.g. the AniDB "Season Unknown" cascade
+        // delete on a freshly-added anime) — a rescan with warm metadata caches
+        // restores them. Without this flag the line reads as healthy and "next"
+        // says nothing to do.
+        let mut warned_empty = false;
         for it in jf.iter().take(3) {
-            let extra = if it.s("Type") == "Series" {
-                jf_api(&format!("/Shows/{}/Episodes", it.s("Id")), &[("Limit", "1")], 60, "GET", true)
-                    .map(|e| format!(", {} episode(s)", e.i("TotalRecordCount")))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+            let mut extra = String::new();
+            if it.s("Type") == "Series" {
+                if let Some(e) =
+                    jf_api(&format!("/Shows/{}/Episodes", it.s("Id")), &[("Limit", "1")], 60, "GET", true)
+                {
+                    let n = e.i("TotalRecordCount");
+                    extra = format!(", {} episode(s)", n);
+                    if n == 0 && disk_files > 0 {
+                        extra.push_str("  ⚠ files on disk but no episodes scanned in");
+                        if !warned_empty {
+                            warned_empty = true;
+                            next.push(format!(
+                                "arr jellyfin refresh --wait '{}'   (rescan usually restores the missing episodes)",
+                                title
+                            ));
+                        }
+                    }
+                }
+            }
             println!("  jellyfin   [{}] {}{}", it.s("Type"), it.s("Name"), extra);
         }
     }

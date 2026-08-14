@@ -27,8 +27,8 @@ use crate::arrs::{
 };
 use crate::config::{
     cfg, DONE_THRESHOLD, FAIL_STALL_WINDOW, FAIL_WAKE_THRESHOLD, JF_CONFIRM_TIMEOUT,
-    MISSING_GRACE, STUCK_SWEEP_EVERY, STUCK_WAKE_AFTER, VERIFY_RECHECK_EVERY,
-    VERIFY_RECHECK_WINDOW,
+    JF_REGRESSION_MAX, JF_REGRESSION_WINDOW, MISSING_GRACE, STUCK_SWEEP_EVERY, STUCK_WAKE_AFTER,
+    VERIFY_RECHECK_EVERY, VERIFY_RECHECK_WINDOW,
 };
 use crate::discord::{edit_message, send_message, send_via_thread};
 use crate::embeds::{build_embed, render_chart, watchable, SeasonLine};
@@ -1008,6 +1008,63 @@ fn confirm_imported(con: &Connection) {
     }
 }
 
+/// A "ready" confirmation can be un-done: Jellyfin's follow-up metadata refresh
+/// may delete the very episodes whose arrival we confirmed (new anime series →
+/// episodes land under a virtual "Season Unknown" while AniDB data is cold →
+/// the refresh removes that season and cascades the episodes away). Re-check
+/// recently-readied items; on regression, trigger a rescan — with warm metadata
+/// caches the episodes come back mapped correctly — and flip the item back to
+/// 'importing' so confirm_imported() re-verifies before "ready" stands again.
+fn recheck_jf_presence(con: &Connection) {
+    let cutoff = now() - JF_REGRESSION_WINDOW;
+    let rows: Vec<(String, String, i64, String, String, String, i64)> = {
+        let mut stmt = match con.prepare(
+            "SELECT key,kind,jf_baseline,tmdb,imdb,tvdb,COALESCE(jf_regressions,0) \
+             FROM notified WHERE phase='done' AND updated_at>? AND COALESCE(jf_regressions,0)<?",
+        ) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mapped = stmt.query_map(params![cutoff, JF_REGRESSION_MAX], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                r.get::<_, Option<i64>>(6)?.unwrap_or(0),
+            ))
+        });
+        match mapped {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => return,
+        }
+    };
+    for (key, kind, jf_baseline, tmdb, imdb, tvdb, regressions) in rows {
+        let present = if kind == "movie" {
+            jf_has_movie(&tmdb, &imdb)
+        } else {
+            jf_series_episode_count(&tvdb, &tmdb, &imdb) > jf_baseline
+        };
+        if present {
+            continue;
+        }
+        log(&format!(
+            "jellyfin presence REGRESSED after ready (attempt {}/{}), rescanning + re-arming: {}",
+            regressions + 1,
+            JF_REGRESSION_MAX,
+            key
+        ));
+        trigger_jellyfin_scan();
+        let _ = con.execute(
+            "UPDATE notified SET phase='importing', import_at=?, \
+             jf_regressions=COALESCE(jf_regressions,0)+1 WHERE key=?",
+            params![now(), key],
+        );
+    }
+}
+
 /// Re-probe items whose language verification failed; live-edit the 🔎 line in
 /// the ✅ embed when subs/audio arrive, and wake Hermes if a Bazarr-fixable gap
 /// outlives its grace window.
@@ -1559,6 +1616,8 @@ fn poll_once(
 
     // Items already imported: ping once Jellyfin has actually scanned them in.
     confirm_imported(con);
+    // Recently-readied items whose episodes Jellyfin deleted again: rescan + re-arm.
+    recheck_jf_presence(con);
     // Failed language verifications: re-probe, live-update the 🔎 line, escalate.
     recheck_verifications(con);
     // Failed downloads with nothing in flight: wake the agent to hunt a source.

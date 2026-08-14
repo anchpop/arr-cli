@@ -57,6 +57,8 @@ pub fn db_conn() -> rusqlite::Result<Connection> {
         ("spooled", "INTEGER"),
         // failure escalation: 1 = Hermes already woken for this item
         ("fail_woken", "INTEGER"),
+        // times a post-ready Jellyfin presence regression re-armed confirmation
+        ("jf_regressions", "INTEGER"),
     ] {
         if !have.contains(col) {
             con.execute_batch(&format!("ALTER TABLE notified ADD COLUMN {} {}", col, decl))?;
