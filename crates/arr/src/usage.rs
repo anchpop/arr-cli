@@ -102,8 +102,8 @@ Commands (sonarr & radarr unless noted):
         (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
-  subtitle-harvest <id|query> --subs LANG [--grab --match SUBSTR] [--limit N]
-        [--dry-run]                                                  (radarr)
+  subtitle-harvest <id|query> --subs LANG [--grab --match SUBSTR]
+        [--fallback 'S1 || S2'] [--limit N] [--dry-run]              (radarr)
   subtitle-harvest --collect [--dry-run] | --adopt [--yes] | --status
         SUBTITLE HARVEST: mine a subtitle track out of a candidate release
         WITHOUT replacing the library file — download to SAB category
@@ -115,7 +115,10 @@ Commands (sonarr & radarr unless noted):
               multi-sub markers, source, smallest-first) — the RANKING IS ONLY
               NAME PATTERNS; the caller reads the list and picks. Then
               --grab --match '<substr>' pushes that one release (refuses an
-              ambiguous match).
+              ambiguous match). --fallback 'S1 || S2' queues runner-up picks:
+              when --collect probes a payload and finds no target subs, it
+              grabs the next one automatically (with --grab registers after
+              the grab; without --grab just registers for an in-flight job).
         --collect: process completed harvest downloads. Extraction targets are
               found by ground truth in the payload, in evidence order: stream
               language tags -> stream titles -> loose subtitle file names

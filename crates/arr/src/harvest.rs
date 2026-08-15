@@ -44,6 +44,7 @@ pub fn cmd_harvest(svc: &str, args: &[String]) {
             ("--subs", 1),
             ("--grab", 0),
             ("--match", 1),
+            ("--fallback", 1),
             ("--limit", 1),
             ("--dry-run", 0),
             ("--collect", 0),
@@ -68,6 +69,13 @@ pub fn cmd_harvest(svc: &str, args: &[String]) {
         die("harvest: --subs LANG is required (which subtitle language to mine)")
     }));
     let limit: usize = flags.val_or("--limit", "8").parse().unwrap_or(8);
+    // `--fallback 'A || B'`: pre-picked runner-up releases, tried IN ORDER by
+    // --collect whenever a payload probe finds no target subs. The picking is
+    // still human/agent judgment — this just queues the judgment up front.
+    let fallbacks: Vec<String> = flags
+        .val("--fallback")
+        .map(|v| v.split("||").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
     let grab = if flags.has("--grab") {
         match flags.val("--match").filter(|m| !m.is_empty()) {
             Some(m) => Some(m),
@@ -76,12 +84,24 @@ pub fn cmd_harvest(svc: &str, args: &[String]) {
     } else {
         None
     };
-    hunt_one(&rest[0], &lang, grab, flags.has("--dry-run"), limit);
+    if grab.is_none() && !fallbacks.is_empty() {
+        // register a fallback chain for an already-in-flight harvest
+        let mid = resolve_id("radarr", &rest[0]);
+        fallbacks_set(mid, &lang, &fallbacks);
+        println!(
+            "registered {} fallback pick(s) for m{} ({}): tried in order when a payload probe fails",
+            fallbacks.len(),
+            mid,
+            lang
+        );
+        return;
+    }
+    hunt_one(&rest[0], &lang, grab, &fallbacks, flags.has("--dry-run"), limit);
 }
 
 // --- per-movie: check, score candidates, grab --------------------------------
 
-fn hunt_one(query: &str, lang: &str, grab: Option<&str>, dry: bool, limit: usize) {
+fn hunt_one(query: &str, lang: &str, grab: Option<&str>, fallbacks: &[String], dry: bool, limit: usize) {
     let mid = resolve_id("radarr", query);
     let movie = api("radarr", "GET", &format!("/movie/{}", mid), None).unwrap_or(Value::Null);
     let title = movie.s("title").to_string();
@@ -193,6 +213,13 @@ fn hunt_one(query: &str, lang: &str, grab: Option<&str>, dry: bool, limit: usize
     if crate::acquire::sab_add_url(best.s("downloadUrl"), SAB_CATEGORY, &job) {
         record_grab(mid, lang, best.s("title"));
         println!("grabbed -> SAB cat={} as {}", SAB_CATEGORY, job);
+        if !fallbacks.is_empty() {
+            fallbacks_set(mid, lang, fallbacks);
+            println!(
+                "  + {} fallback pick(s) registered — --collect grabs the next one automatically if the payload probe fails",
+                fallbacks.len()
+            );
+        }
         println!("Radarr never sees this download. When it completes: arr radarr subtitle-harvest --collect");
     } else {
         println!("FAILED to add to SAB: {}", best.s("title"));
@@ -381,6 +408,108 @@ fn record_grab(mid: i64, lang: &str, title: &str) {
     record_outcome(mid, lang, title, "downloading");
 }
 
+// Pre-picked runner-up releases per movie+lang, consumed head-first by
+// collect when a payload probe fails. state: {"fallbacks": {"mid:lang": ["match", ...]}}
+
+fn fallbacks_set(mid: i64, lang: &str, matches: &[String]) {
+    let mut st = state_load();
+    if !st.has("fallbacks") {
+        st["fallbacks"] = json!({});
+    }
+    st["fallbacks"][format!("{}:{}", mid, lang)] = json!(matches);
+    state_save(&st);
+}
+
+/// Take the whole remaining chain for a movie (any lang key — chains are
+/// per-movie in practice; the lang in the key is just bookkeeping).
+fn fallbacks_take(mid: i64) -> Option<(String, Vec<String>)> {
+    let st = state_load();
+    let fb = st.at(&["fallbacks"]).as_object()?;
+    let prefix = format!("{}:", mid);
+    for (k, v) in fb {
+        if k.starts_with(&prefix) {
+            let list: Vec<String> = v
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default();
+            if !list.is_empty() {
+                return Some((k.clone(), list));
+            }
+        }
+    }
+    None
+}
+
+fn fallbacks_store(key: &str, remaining: &[String]) {
+    let mut st = state_load();
+    if !st.has("fallbacks") {
+        st["fallbacks"] = json!({});
+    }
+    if remaining.is_empty() {
+        if let Some(o) = st["fallbacks"].as_object_mut() {
+            o.remove(key);
+        }
+    } else {
+        st["fallbacks"][key] = json!(remaining);
+    }
+    state_save(&st);
+}
+
+/// A payload probe failed: grab the next pre-picked release, if any. Works
+/// down the chain until one grab succeeds (a vanished release just advances).
+fn try_fallback(mid: i64, lang: &str, dry: bool) {
+    let (key, mut chain) = match fallbacks_take(mid) {
+        Some(x) => x,
+        None => return,
+    };
+    println!("  fallback chain has {} pick(s) — searching for the next one", chain.len());
+    if dry {
+        println!("  DRY: would grab first available of: {}", chain.join(" || "));
+        return;
+    }
+    let rels = match arr_api::try_api(
+        "radarr",
+        "GET",
+        &format!("/release?movieId={}", mid),
+        None,
+        crate::browse::SEARCH_TIMEOUT,
+    ) {
+        Ok(v) => v,
+        Err(_) => {
+            println!("  release search failed — chain kept for next --collect");
+            return;
+        }
+    };
+    while !chain.is_empty() {
+        let want = chain.remove(0).to_lowercase();
+        let mut cands: Vec<&Value> = items(&rels)
+            .iter()
+            .filter(|r| {
+                r.s("protocol") == "usenet"
+                    && !r.s("downloadUrl").is_empty()
+                    && r.s("title").to_lowercase().contains(&want)
+            })
+            .collect();
+        cands.sort_by_key(|r| r.i("size"));
+        match cands.first() {
+            Some(best) => {
+                ensure_sab_category();
+                let job = job_name(mid, lang, best.s("title"));
+                if crate::acquire::sab_add_url(best.s("downloadUrl"), SAB_CATEGORY, &job) {
+                    record_grab(mid, lang, best.s("title"));
+                    fallbacks_store(&key, &chain);
+                    println!("  fallback grabbed: {}", best.s("title"));
+                    return;
+                }
+                println!("  fallback SAB add failed for '{}' — trying next", want);
+            }
+            None => println!("  fallback '{}' matches no available release — trying next", want),
+        }
+    }
+    fallbacks_store(&key, &chain);
+    println!("  fallback chain exhausted — film goes to the provider/retry path");
+}
+
 fn now_iso() -> String {
     // chrono-free local-enough timestamp (UTC), matching the notes elsewhere
     let secs = std::time::SystemTime::now()
@@ -460,6 +589,11 @@ fn collect(dry: bool) {
                 println!("  payload deleted (SAB history + files)");
             } else {
                 println!("  payload KEPT (outcome: {}) — will retry next --collect", outcome);
+            }
+            // probe came up empty -> advance the pre-picked fallback chain
+            if let Some(missing) = outcome.strip_prefix("no-").and_then(|s| s.strip_suffix("-subs")) {
+                let lang = missing.split('+').next().unwrap_or(&name_lang).to_string();
+                try_fallback(mid, &lang, dry);
             }
         }
         if outcome.starts_with("harvested") {
