@@ -13,11 +13,11 @@
 //! Radarr-only for now (the hunt is movie-scoped; extend to sonarr when a
 //! show actually needs it).
 //!
-//!   arr radarr harvest <id|query> --subs LANG [--grab] [--limit N] [--dry-run]
-//!   arr radarr harvest --collect [--dry-run]     process completed downloads
-//!   arr radarr harvest --adopt [--yes]           take over Radarr-queued
+//!   arr radarr subtitle-harvest <id|query> --subs LANG [--grab] [--limit N] [--dry-run]
+//!   arr radarr subtitle-harvest --collect [--dry-run]     process completed downloads
+//!   arr radarr subtitle-harvest --adopt [--yes]           take over Radarr-queued
 //!                                                language-replacement downloads
-//!   arr radarr harvest --status                  jobs in flight + tried-list
+//!   arr radarr subtitle-harvest --status                  jobs in flight + tried-list
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
@@ -43,6 +43,7 @@ pub fn cmd_harvest(svc: &str, args: &[String]) {
         &[
             ("--subs", 1),
             ("--grab", 0),
+            ("--match", 1),
             ("--limit", 1),
             ("--dry-run", 0),
             ("--collect", 0),
@@ -67,12 +68,20 @@ pub fn cmd_harvest(svc: &str, args: &[String]) {
         die("harvest: --subs LANG is required (which subtitle language to mine)")
     }));
     let limit: usize = flags.val_or("--limit", "8").parse().unwrap_or(8);
-    hunt_one(&rest[0], &lang, flags.has("--grab"), flags.has("--dry-run"), limit);
+    let grab = if flags.has("--grab") {
+        match flags.val("--match").filter(|m| !m.is_empty()) {
+            Some(m) => Some(m),
+            None => die("subtitle-harvest: --grab needs --match '<title substring>' — the caller picks the release, the CLI only ranks (list first without --grab)"),
+        }
+    } else {
+        None
+    };
+    hunt_one(&rest[0], &lang, grab, flags.has("--dry-run"), limit);
 }
 
 // --- per-movie: check, score candidates, grab --------------------------------
 
-fn hunt_one(query: &str, lang: &str, grab: bool, dry: bool, limit: usize) {
+fn hunt_one(query: &str, lang: &str, grab: Option<&str>, dry: bool, limit: usize) {
     let mid = resolve_id("radarr", query);
     let movie = api("radarr", "GET", &format!("/movie/{}", mid), None).unwrap_or(Value::Null);
     let title = movie.s("title").to_string();
@@ -97,7 +106,7 @@ fn hunt_one(query: &str, lang: &str, grab: bool, dry: bool, limit: usize) {
     for s in sabq.at(&["queue", "slots"]).as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
         if s.s("cat") == SAB_CATEGORY && parse_job_name(s.s("filename")).0 == mid {
             println!(
-                "harvest already downloading: {} ({}%) — run `arr radarr harvest --collect` when done",
+                "harvest already downloading: {} ({}%) — run `arr radarr subtitle-harvest --collect` when done",
                 s.s("filename"),
                 s.s("percentage")
             );
@@ -145,18 +154,36 @@ fn hunt_one(query: &str, lang: &str, grab: bool, dry: bool, limit: usize) {
             if why.is_empty() { "no language evidence".into() } else { why.join(", ") }
         );
     }
-    if !grab {
-        println!("(pass --grab to send the top candidate to SAB category '{}')", SAB_CATEGORY);
-        return;
-    }
-    let (score, _, best) = &cands[0];
-    if *score <= 0 {
-        println!(
-            "top candidate has no positive language evidence (score {:+}) — grabbing anyway is usually wasted bandwidth; not grabbing. Re-run with a better candidate via `arr prowlarr grab --cat {}` if you disagree.",
-            score, SAB_CATEGORY
-        );
-        return;
-    }
+    // The score is name-pattern evidence, not knowledge — the caller (a
+    // person or the agent driving this) picks the release; the CLI only
+    // ranks and annotates. Mirrors `grab --match`.
+    let matchf = match grab {
+        None => {
+            println!(
+                "(pick one with --grab --match '<title substring>' — the ranking is name-evidence only)"
+            );
+            return;
+        }
+        Some(m) => m.to_lowercase(),
+    };
+    let picked: Vec<&(i64, Vec<&'static str>, Value)> = cands
+        .iter()
+        .filter(|(_, _, r)| r.s("title").to_lowercase().contains(&matchf))
+        .collect();
+    let (_, _, best) = match picked.as_slice() {
+        [] => {
+            println!("no candidate matches '{}' — check the exact titles above", matchf);
+            return;
+        }
+        [one] => *one,
+        many => {
+            println!("--match '{}' hits {} candidates — narrow it:", matchf, many.len());
+            for (_, _, r) in many.iter().take(10) {
+                println!("  {}", r.s("title"));
+            }
+            return;
+        }
+    };
     if dry {
         println!("DRY grab: {}", best.s("title"));
         return;
@@ -166,7 +193,7 @@ fn hunt_one(query: &str, lang: &str, grab: bool, dry: bool, limit: usize) {
     if crate::acquire::sab_add_url(best.s("downloadUrl"), SAB_CATEGORY, &job) {
         record_grab(mid, lang, best.s("title"));
         println!("grabbed -> SAB cat={} as {}", SAB_CATEGORY, job);
-        println!("Radarr never sees this download. When it completes: arr radarr harvest --collect");
+        println!("Radarr never sees this download. When it completes: arr radarr subtitle-harvest --collect");
     } else {
         println!("FAILED to add to SAB: {}", best.s("title"));
     }
@@ -480,38 +507,22 @@ fn harvest_payload(mid: i64, name_lang: &str, storage: &str, dry: bool) -> Strin
         return "already-satisfied".into();
     }
 
-    let videos = payload_videos(storage);
-    if videos.is_empty() {
-        println!("  ⚠ no video files found under {}", storage);
+    let (videos, loose) = payload_scan(storage);
+    if videos.is_empty() && loose.is_empty() {
+        println!("  ⚠ no video or subtitle files found under {}", storage);
         return "empty-payload".into();
     }
     let mut got: Vec<String> = vec![];
     for lang in &missing {
-        let mut found = false;
-        for v in &videos {
-            let streams = match crate::policy::ffprobe_streams(v) {
-                Some(s) => s,
-                None => continue,
-            };
-            let matches: Vec<&Value> = streams
-                .iter()
-                .filter(|st| {
-                    st.s("codec_type") == "subtitle"
-                        && norm_lang(st.at(&["tags", "language"]).as_str().unwrap_or("")) == *lang
-                })
-                .collect();
-            if matches.is_empty() {
-                continue;
-            }
-            let n = extract_streams(v, &matches, lang, &dest, dry);
-            if n > 0 {
+        match harvest_lang(&videos, &loose, lang, &dest, dry) {
+            Some(signal) => {
+                println!("  {} subs harvested (signal: {})", lang, signal);
                 got.push(lang.clone());
-                found = true;
-                break;
             }
-        }
-        if !found {
-            println!("  no {} subtitle stream in payload", lang);
+            None => println!(
+                "  no {} subtitles in payload (checked stream language tags, stream titles, loose file names, text script)",
+                lang
+            ),
         }
     }
     if got.is_empty() {
@@ -528,6 +539,242 @@ fn harvest_payload(mid: i64, name_lang: &str, storage: &str, dry: bool) -> Strin
         );
     }
     format!("harvested-{}", got.join("+"))
+}
+
+/// One language, every signal in evidence order. Returns the signal that
+/// produced a sidecar, or None.
+///
+/// 1. embedded stream whose language TAG matches
+/// 2. embedded stream whose TITLE names the language while the tag is und/absent
+///    ("Hindi", "Korean (SDH)" — release muxers fill titles more often than tags)
+/// 3. loose subtitle FILE whose name indicates the language ("Hindi.srt",
+///    "2_Korean.srt", "movie.hin.srt", an .idx/.sub pair)
+/// 4. und/untagged TEXT streams judged by their content's writing system —
+///    a stream that is mostly Devanagari IS the Hindi track (non-Latin-script
+///    targets only; Latin-script languages are indistinguishable this cheaply)
+fn harvest_lang(
+    videos: &[String],
+    loose: &[String],
+    lang: &str,
+    dest: &str,
+    dry: bool,
+) -> Option<&'static str> {
+    // 1 + 2: embedded streams, tag first then title
+    for pass in 0..2 {
+        for v in videos {
+            let streams = match crate::policy::ffprobe_streams(v) {
+                Some(s) => s,
+                None => continue,
+            };
+            let matches: Vec<&Value> = streams
+                .iter()
+                .filter(|st| {
+                    if st.s("codec_type") != "subtitle" {
+                        return false;
+                    }
+                    let tag = norm_lang(st.at(&["tags", "language"]).as_str().unwrap_or(""));
+                    if pass == 0 {
+                        tag == *lang
+                    } else {
+                        tag == "und" && name_indicates(st.at(&["tags", "title"]).as_str().unwrap_or(""), lang)
+                    }
+                })
+                .collect();
+            if !matches.is_empty() && extract_streams(v, &matches, lang, dest, dry) > 0 {
+                return Some(if pass == 0 { "embedded language tag" } else { "embedded stream title" });
+            }
+        }
+    }
+    // 3: loose subtitle files named for the language
+    let mut copied = 0;
+    for f in loose {
+        let fname = f.rsplit('/').next().unwrap_or(f);
+        if !name_indicates(fname, lang) {
+            continue;
+        }
+        if f.to_lowercase().ends_with(".sub") && loose.iter().any(|o| o.to_lowercase().ends_with(".idx")) {
+            continue; // the .idx half of a VobSub pair drives the copy of both
+        }
+        copied += copy_loose_sub(f, loose, lang, dest, dry);
+    }
+    if copied > 0 {
+        return Some("loose subtitle file name");
+    }
+    // 4: untagged text streams, judged by writing system
+    if script_check_supported(lang) {
+        for v in videos {
+            let streams = match crate::policy::ffprobe_streams(v) {
+                Some(s) => s,
+                None => continue,
+            };
+            for st in &streams {
+                if st.s("codec_type") != "subtitle" {
+                    continue;
+                }
+                let tag = norm_lang(st.at(&["tags", "language"]).as_str().unwrap_or(""));
+                if tag != "und" {
+                    continue; // tagged as something else — believe the tag
+                }
+                if !matches!(st.s("codec_name"), "subrip" | "srt" | "ass" | "ssa" | "mov_text" | "webvtt") {
+                    continue; // bitmap subs have no text to judge
+                }
+                let text = match probe_stream_text(v, st.i("index")) {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if text_matches_lang(&text, lang)
+                    && extract_streams(v, &[st], lang, dest, dry) > 0
+                {
+                    return Some("text script detection");
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Language evidence in a file/track NAME: full language words (from the
+/// release-scoring marker list) or unambiguous ISO-ish code tokens. "hi" and
+/// "it" are deliberately absent (hearing-impaired / English words).
+fn name_indicates(name: &str, lang: &str) -> bool {
+    let n = name.to_lowercase();
+    if native_markers(lang).iter().any(|m| n.contains(m)) {
+        return true;
+    }
+    if lang == "eng" && n.contains("english") {
+        return true;
+    }
+    let codes: &[&str] = match lang {
+        "eng" => &["eng", "en"],
+        "hin" => &["hin"],
+        "kor" => &["kor", "ko"],
+        "chi" => &["chi", "zho", "chs", "cht", "zh"],
+        "jpn" => &["jpn", "jap", "ja"],
+        "fre" => &["fre", "fra", "fr"],
+        "ger" => &["ger", "deu", "de"],
+        "spa" => &["spa", "esp", "es"],
+        "ita" => &["ita"],
+        "rus" => &["rus", "ru"],
+        "por" => &["por", "pob", "pt"],
+        "tha" => &["tha", "th"],
+        "tel" => &["tel"],
+        "tam" => &["tam"],
+        _ => &[],
+    };
+    // the normalized 3-letter code itself always counts as a token
+    n.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == lang || codes.contains(&tok))
+}
+
+/// Copy a loose subtitle file (plus the .sub half of a VobSub pair) as a
+/// language-named sidecar next to `dest`. Returns #files placed.
+fn copy_loose_sub(src: &str, loose: &[String], lang: &str, dest: &str, dry: bool) -> usize {
+    let base = dest.rsplit_once('.').map(|(b, _)| b.to_string()).unwrap_or_else(|| dest.into());
+    let ext = src.rsplit('.').next().unwrap_or("").to_lowercase();
+    let mut placed = 0;
+    let mut pairs: Vec<(String, String)> = vec![(src.to_string(), format!("{}.{}.{}", base, lang, ext))];
+    if ext == "idx" {
+        // VobSub: bring the .sub half along under the same sidecar name
+        let sub_src = format!("{}.sub", src.strip_suffix(".idx").unwrap_or(src));
+        if loose.iter().any(|o| o == &sub_src) || std::path::Path::new(&sub_src).exists() {
+            pairs.push((sub_src, format!("{}.{}.sub", base, lang)));
+        } else {
+            println!("  ⚠ {} has no matching .sub — VobSub pair incomplete, skipping", src);
+            return 0;
+        }
+    }
+    for (from, to) in pairs {
+        if std::path::Path::new(&to).exists() {
+            println!("  sidecar already exists: {}", to);
+            continue;
+        }
+        if dry {
+            println!("  DRY copy {} -> {}", from, to);
+            placed += 1;
+            continue;
+        }
+        match std::fs::copy(&from, &to) {
+            Ok(_) => {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o644));
+                println!("  copied {} -> {}", from, to);
+                placed += 1;
+            }
+            Err(e) => println!("  copy FAILED {} -> {}: {}", from, to, e),
+        }
+    }
+    placed
+}
+
+/// Dump one text subtitle stream as SRT to stdout (bounded) for script
+/// detection — no temp files.
+fn probe_stream_text(video: &str, index: i64) -> Option<String> {
+    let out = Command::new("ffmpeg")
+        .args(["-nostdin", "-v", "error", "-i", video, "-map"])
+        .arg(format!("0:{}", index))
+        .args(["-c:s", "srt", "-f", "srt", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut n = s.len().min(2_000_000);
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1; // never truncate mid-codepoint (multibyte scripts!)
+    }
+    s.truncate(n);
+    Some(s)
+}
+
+fn script_check_supported(lang: &str) -> bool {
+    matches!(lang, "hin" | "kor" | "jpn" | "chi" | "tha" | "rus" | "ara" | "heb" | "tel" | "tam")
+}
+
+/// Is this subtitle text written (mostly) in `lang`'s writing system?
+/// Blunt on purpose: ≥200 letters, ≥30% in the target script. Cyrillic→rus /
+/// Devanagari→hin conflate sibling languages, which is fine here — the movie's
+/// own original language is the context. chi vs jpn disambiguate on kana.
+fn text_matches_lang(text: &str, lang: &str) -> bool {
+    let (mut letters, mut target, mut kana, mut cjk) = (0usize, 0usize, 0usize, 0usize);
+    for c in text.chars() {
+        let u = c as u32;
+        if c.is_alphabetic() {
+            letters += 1;
+        }
+        match u {
+            0x3040..=0x30FF => kana += 1,
+            0x4E00..=0x9FFF => cjk += 1,
+            _ => {}
+        }
+        let hit = match lang {
+            "hin" => (0x0900..=0x097F).contains(&u),
+            "kor" => (0xAC00..=0xD7AF).contains(&u) || (0x1100..=0x11FF).contains(&u),
+            "jpn" => (0x3040..=0x30FF).contains(&u) || (0x4E00..=0x9FFF).contains(&u),
+            "chi" => (0x4E00..=0x9FFF).contains(&u),
+            "tha" => (0x0E00..=0x0E7F).contains(&u),
+            "rus" => (0x0400..=0x04FF).contains(&u),
+            "ara" => (0x0600..=0x06FF).contains(&u),
+            "heb" => (0x0590..=0x05FF).contains(&u),
+            "tel" => (0x0C00..=0x0C7F).contains(&u),
+            "tam" => (0x0B80..=0x0BFF).contains(&u),
+            _ => false,
+        };
+        if hit {
+            target += 1;
+        }
+    }
+    if letters < 200 || target * 10 < letters * 3 {
+        return false;
+    }
+    match lang {
+        // Japanese text always mixes kana in; Chinese has (almost) none
+        "jpn" => kana * 50 >= kana + cjk,
+        "chi" => kana * 50 < kana + cjk,
+        _ => true,
+    }
 }
 
 /// Extract matching streams as sidecars next to `dest`. Returns #files written.
@@ -547,10 +794,11 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
             "mov_text" => ("srt", Some("srt")),
             "webvtt" => ("vtt", None),
             "hdmv_pgs_subtitle" => ("sup", None),
-            "dvd_subtitle" => {
-                println!("  skipping dvd_subtitle stream (vobsub needs mkvextract; convert by hand if wanted)");
-                continue;
-            }
+            // VobSub: ffmpeg can't write a bare .idx/.sub pair, but a
+            // subtitle-only Matroska (.mks) sidecar carries it losslessly and
+            // Jellyfin serves .mks externally. (mkvextract would give .idx/.sub
+            // directly, but mkvtoolnix isn't on the box.)
+            "dvd_subtitle" => ("mks", None),
             other => {
                 println!("  skipping unsupported subtitle codec '{}'", other);
                 continue;
@@ -609,8 +857,10 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
     written
 }
 
-fn payload_videos(dir: &str) -> Vec<String> {
-    let mut out = vec![];
+/// (video files largest-first, loose subtitle files) under the payload.
+fn payload_scan(dir: &str) -> (Vec<String>, Vec<String>) {
+    let mut videos = vec![];
+    let mut subs = vec![];
     // SAB's history `storage` sometimes points at the payload FILE itself
     // (single-file jobs), not the job directory — walk the parent then.
     let root = if std::path::Path::new(dir).is_file() {
@@ -634,12 +884,18 @@ fn payload_videos(dir: &str) -> Vec<String> {
             if [".mkv", ".mp4", ".avi", ".m2ts", ".ts", ".wmv"].iter().any(|x| name.ends_with(x))
                 && e.metadata().map(|m| m.len() >= MIN_VIDEO_BYTES).unwrap_or(false)
             {
-                out.push(p.to_string_lossy().into_owned());
+                videos.push(p.to_string_lossy().into_owned());
+            } else if [".srt", ".ass", ".ssa", ".sup", ".vtt", ".idx", ".sub"]
+                .iter()
+                .any(|x| name.ends_with(x))
+            {
+                subs.push(p.to_string_lossy().into_owned());
             }
         }
     }
-    out.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
-    out
+    videos.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
+    subs.sort();
+    (videos, subs)
 }
 
 fn sab_delete_history(nzo: &str) {
@@ -775,7 +1031,7 @@ fn adopt(yes: bool) {
         harvested
     );
     if converted > 0 {
-        println!("run `arr radarr harvest --collect` as downloads complete (cron-friendly)");
+        println!("run `arr radarr subtitle-harvest --collect` as downloads complete (cron-friendly)");
     }
 }
 
@@ -871,6 +1127,36 @@ mod harvest_tests {
         assert!(!n.contains(' ') && !n.contains('['));
         assert_eq!(parse_job_name(&n), (403, "hin".to_string()));
         assert_eq!(parse_job_name("Some.Random.Release.2020"), (0, String::new()));
+    }
+
+    #[test]
+    fn filename_language_indication() {
+        assert!(name_indicates("2_Korean.srt", "kor"));
+        assert!(name_indicates("Hindi.srt", "hin"));
+        assert!(name_indicates("Movie.Name.2010.hin.srt", "hin"));
+        assert!(name_indicates("English (SDH).srt", "eng"));
+        assert!(name_indicates("subs/movie.fr.forced.srt", "fre"));
+        assert!(!name_indicates("Movie.HI.srt", "hin")); // hi = hearing-impaired, not Hindi
+        assert!(!name_indicates("It.Follows.srt", "ita")); // "it" is an English word
+        assert!(!name_indicates("English.srt", "kor"));
+    }
+
+    #[test]
+    fn text_script_detection() {
+        let hindi = "नमस्ते दुनिया यह एक परीक्षण है ".repeat(30);
+        let english = "hello world this is a test of the script detector ".repeat(30);
+        let korean = "안녕하세요 세계 이것은 시험입니다 ".repeat(30);
+        let japanese = "こんにちは世界これはテストです漢字も含む ".repeat(30);
+        let chinese = "你好世界这是一个测试字幕文件内容 ".repeat(30);
+        assert!(text_matches_lang(&hindi, "hin"));
+        assert!(!text_matches_lang(&english, "hin"));
+        assert!(text_matches_lang(&korean, "kor"));
+        assert!(text_matches_lang(&japanese, "jpn"));
+        assert!(!text_matches_lang(&japanese, "chi")); // kana present -> not Chinese
+        assert!(text_matches_lang(&chinese, "chi"));
+        let short: String = hindi.chars().take(20).collect();
+        assert!(!text_matches_lang(&short, "hin")); // too short to judge
+        assert!(!text_matches_lang(&english, "eng")); // Latin targets unsupported
     }
 
     #[test]

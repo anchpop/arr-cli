@@ -102,19 +102,27 @@ Commands (sonarr & radarr unless noted):
         (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
-  harvest <id|query> --subs LANG [--grab] [--limit N] [--dry-run]   (radarr)
-  harvest --collect [--dry-run] | --adopt [--yes] | --status
+  subtitle-harvest <id|query> --subs LANG [--grab --match SUBSTR] [--limit N]
+        [--dry-run]                                                  (radarr)
+  subtitle-harvest --collect [--dry-run] | --adopt [--yes] | --status
         SUBTITLE HARVEST: mine a subtitle track out of a candidate release
         WITHOUT replacing the library file — download to SAB category
         'subs-harvest' (invisible to Radarr: no queue record, no import, no
         quality question), extract the wanted-language sub streams as
         world-readable sidecars next to the existing file, delete the payload.
         Use this instead of a replacement grab when a movie only lacks subs.
-        <id> --subs L: check + score candidates (native-market/multi-sub
-              evidence, smallest first); --grab pushes the best one.
-        --collect: process completed harvest downloads (extract, verify via
-              ffprobe, clean up, Jellyfin refresh). Cron-friendly; failures
-              land in a tried-list so the next --grab skips them.
+        <id> --subs L: list candidates ranked by name evidence (native-market/
+              multi-sub markers, source, smallest-first) — the RANKING IS ONLY
+              NAME PATTERNS; the caller reads the list and picks. Then
+              --grab --match '<substr>' pushes that one release (refuses an
+              ambiguous match).
+        --collect: process completed harvest downloads. Extraction targets are
+              found by ground truth in the payload, in evidence order: stream
+              language tags -> stream titles -> loose subtitle file names
+              ("Hindi.srt", .idx/.sub pairs) -> the text's actual writing
+              system for untagged text streams (a mostly-Devanagari stream IS
+              the Hindi track). Text->same-ext sidecar, PGS->.sup,
+              VobSub->.mks. Cron-friendly; failures land in a tried-list.
         --adopt: take over require-subs-tagged replacement downloads sitting
               in RADARR's queue (rename -> change SAB category -> drop the
               queue record, keeping the download); completed ones are

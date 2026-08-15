@@ -1198,8 +1198,11 @@ fn sidecar_subs(path: &str) -> Vec<Track> {
             || fl.ends_with(".ssa")
             || fl.ends_with(".sub")
             || fl.ends_with(".vtt")
-            // external PGS — Jellyfin serves .sup sidecars; harvest writes them
-            || fl.ends_with(".sup"))
+            // bitmap sidecars subtitle-harvest writes (Jellyfin serves all
+            // three externally): PGS .sup, VobSub .idx(+.sub), Matroska .mks
+            || fl.ends_with(".sup")
+            || fl.ends_with(".idx")
+            || fl.ends_with(".mks"))
         {
             continue;
         }
