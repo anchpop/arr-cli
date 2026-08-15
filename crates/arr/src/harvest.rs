@@ -561,6 +561,10 @@ fn collect(dry: bool) {
                     }
                     sab_delete_history(&nzo);
                 }
+                // a dead release advances the chain just like an empty payload
+                if mid > 0 {
+                    try_fallback(mid, &name_lang, dry);
+                }
                 continue;
             }
             other => {
