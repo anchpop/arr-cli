@@ -11,6 +11,7 @@ use arr_api::die;
 mod acquire;
 mod browse;
 mod disk;
+mod harvest;
 mod integrations;
 mod locate;
 mod policy;
@@ -142,6 +143,7 @@ pub fn run_svc_command(svc: &str, cmd: &str, args: &[String]) {
                 "tracks" => policy::cmd_tracks(svc, args),
                 "watch" => policy::cmd_watch(svc, args),
                 "replace" => policy::cmd_replace(svc, args),
+                "harvest" => harvest::cmd_harvest(svc, args),
                 c => die(&format!("unknown command '{}' (try: arr --help)", c)),
     }
 }

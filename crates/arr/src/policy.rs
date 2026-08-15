@@ -32,7 +32,7 @@ fn py_get(v: &Value, key: &str) -> String {
 }
 
 /// Python truthiness for a JSON value (ffprobe dispositions are 0/1 ints).
-fn truthy(v: &Value) -> bool {
+pub(crate) fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
         Value::Bool(b) => *b,
@@ -90,7 +90,7 @@ fn now_i64() -> i64 {
 }
 
 /// time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(secs)).
-fn utc_iso(secs: i64) -> String {
+pub(crate) fn utc_iso(secs: i64) -> String {
     let days = secs.div_euclid(86400);
     let rem = secs.rem_euclid(86400);
     let (h, mi, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
@@ -1111,7 +1111,7 @@ fn which_ffprobe() -> Option<String> {
 }
 
 /// ffprobe -show_streams as JSON; None = unreadable (error/timeout/bad JSON).
-fn ffprobe_streams(path: &str) -> Option<Vec<Value>> {
+pub(crate) fn ffprobe_streams(path: &str) -> Option<Vec<Value>> {
     let exe = which_ffprobe().unwrap_or_else(|| {
         die("ffprobe not on PATH — add ffmpeg to environment.systemPackages and rebuild")
     });
@@ -1197,7 +1197,9 @@ fn sidecar_subs(path: &str) -> Vec<Track> {
             || fl.ends_with(".ass")
             || fl.ends_with(".ssa")
             || fl.ends_with(".sub")
-            || fl.ends_with(".vtt"))
+            || fl.ends_with(".vtt")
+            // external PGS — Jellyfin serves .sup sidecars; harvest writes them
+            || fl.ends_with(".sup"))
         {
             continue;
         }
@@ -1213,7 +1215,9 @@ fn sidecar_subs(path: &str) -> Vec<Track> {
             })
             .collect();
         out.push(Track {
-            lang: norm_lang(langs.first().copied().unwrap_or("")),
+            // last lang-looking token wins: the language sits closest to the
+            // extension by convention ("Movie.yap.jpn.srt" is jpn, not "yap")
+            lang: norm_lang(langs.last().copied().unwrap_or("")),
             codec: Some(format!("sidecar-{}", parts.last().copied().unwrap_or(""))),
             default: false,
             forced: parts.contains(&"forced"),

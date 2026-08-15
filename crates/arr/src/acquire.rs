@@ -261,7 +261,7 @@ fn sab_try_get(mode: &str, params: &[(&str, &str)]) -> Result<Value, String> {
 
 // --- download clients ---------------------------------------------------------
 
-fn sab_add_url(url: &str, cat: &str, name: &str) -> bool {
+pub(crate) fn sab_add_url(url: &str, cat: &str, name: &str) -> bool {
     let mut params: Vec<(&str, &str)> = vec![("name", url), ("cat", cat)];
     if !name.is_empty() {
         params.push(("nzbname", name));

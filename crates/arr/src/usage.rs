@@ -102,6 +102,24 @@ Commands (sonarr & radarr unless noted):
         (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
+  harvest <id|query> --subs LANG [--grab] [--limit N] [--dry-run]   (radarr)
+  harvest --collect [--dry-run] | --adopt [--yes] | --status
+        SUBTITLE HARVEST: mine a subtitle track out of a candidate release
+        WITHOUT replacing the library file — download to SAB category
+        'subs-harvest' (invisible to Radarr: no queue record, no import, no
+        quality question), extract the wanted-language sub streams as
+        world-readable sidecars next to the existing file, delete the payload.
+        Use this instead of a replacement grab when a movie only lacks subs.
+        <id> --subs L: check + score candidates (native-market/multi-sub
+              evidence, smallest first); --grab pushes the best one.
+        --collect: process completed harvest downloads (extract, verify via
+              ffprobe, clean up, Jellyfin refresh). Cron-friendly; failures
+              land in a tried-list so the next --grab skips them.
+        --adopt: take over require-subs-tagged replacement downloads sitting
+              in RADARR's queue (rename -> change SAB category -> drop the
+              queue record, keeping the download); completed ones are
+              harvested in place. Items with require-audio tags are left
+              alone — a sidecar can't fix audio.
   tag <id|query> [--requester <discordId>] [--require-subs LANG]
         [--require-audio LANG] [--remove]   (sonarr/radarr)
         requester-*: download-notifier DMs that person a live progress bar.
