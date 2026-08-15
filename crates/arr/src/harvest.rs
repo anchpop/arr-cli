@@ -110,7 +110,7 @@ fn hunt_one(query: &str, lang: &str, grab: Option<&str>, fallbacks: &[String], d
     let path = movie_file_path(mid, &movie);
     if let Some(p) = &path {
         let (_, subs, readable) = file_tracks(p);
-        if readable && subs.iter().any(|t| t.lang == *lang) {
+        if readable && subs.iter().any(|t| t.covers(lang)) {
             println!("already satisfied: {} subs present on {}", lang, p);
             return;
         }
@@ -639,7 +639,7 @@ fn harvest_payload(mid: i64, name_lang: &str, storage: &str, dry: bool) -> Strin
     // still missing = wanted minus what the library file already has
     let (_, have, _) = file_tracks(&dest);
     let missing: Vec<String> =
-        wanted.iter().filter(|l| !have.iter().any(|t| t.lang == **l)).cloned().collect();
+        wanted.iter().filter(|l| !have.iter().any(|t| t.covers(l))).cloned().collect();
     if missing.is_empty() {
         println!("  {} subs already present on library file — nothing to do", wanted.join("+"));
         return "already-satisfied".into();
@@ -669,7 +669,7 @@ fn harvest_payload(mid: i64, name_lang: &str, storage: &str, dry: bool) -> Strin
     // verify: the sidecars must now show up on the library file
     let (_, after, _) = file_tracks(&dest);
     for l in &got {
-        let ok = after.iter().any(|t| t.lang == *l);
+        let ok = after.iter().any(|t| t.covers(l));
         println!(
             "  verify: {} subs on library file {}",
             l,
@@ -915,13 +915,19 @@ fn text_matches_lang(text: &str, lang: &str) -> bool {
     }
 }
 
-/// Extract matching streams as sidecars next to `dest`. Returns #files written.
+/// Extract matching streams as sidecars next to `dest`.
+///
+/// Returns the number of FULL (non-forced) tracks secured. Forced tracks are
+/// still extracted alongside as a labeled bonus, but they are signs-only and
+/// must not make a harvest report success on their own — a forced-only
+/// "harvest" is exactly the false positive that marked Gramps Is in the
+/// Resistance subtitle-complete.
 fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bool) -> usize {
     let base = dest.rsplit_once('.').map(|(b, _)| b.to_string()).unwrap_or_else(|| dest.into());
-    let mut written = 0usize;
+    let mut full = 0usize;
     let mut did_full = false;
     for st in subs {
-        let forced = crate::policy::truthy(st.at(&["disposition", "forced"]));
+        let forced = crate::policy::stream_is_forced(st);
         if !forced && did_full {
             continue; // one full track is enough
         }
@@ -947,15 +953,16 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
             println!("  sidecar already exists: {}", out);
             if !forced {
                 did_full = true;
+                full += 1;
             }
             continue;
         }
         let idx = st.i("index").to_string();
         if dry {
             println!("  DRY extract 0:{} ({}) -> {}", idx, codec, out);
-            written += 1;
             if !forced {
                 did_full = true;
+                full += 1;
             }
             continue;
         }
@@ -980,9 +987,9 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o644));
             println!("  extracted 0:{} ({}) -> {}", idx, codec, out);
-            written += 1;
             if !forced {
                 did_full = true;
+                full += 1;
             }
         } else {
             let _ = std::fs::remove_file(&out); // never leave a truncated sidecar
@@ -992,7 +999,7 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
             println!("  extract FAILED 0:{} ({}): {}", idx, codec, errtxt.trim());
         }
     }
-    written
+    full
 }
 
 /// (video files largest-first, loose subtitle files) under the payload.

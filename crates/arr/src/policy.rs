@@ -1091,6 +1091,25 @@ pub struct Track {
     pub codec: Option<String>,
     pub default: bool,
     pub forced: bool,
+    /// A `.yap.<lang>.srt` sidecar: yap.town's own aligned-subtitle output,
+    /// derived from subtitles yap already has and retracted whenever its
+    /// pipeline stops standing behind it.
+    pub yap: bool,
+}
+
+impl Track {
+    /// Does this track actually give a viewer dialogue subtitles in `lang`?
+    ///
+    /// A forced track carries signs and foreign lines only (Gramps Is in the
+    /// Resistance was marked subtitle-complete off a Forced-disposition fre
+    /// track on 2026-08-15), and a `.yap.*` sidecar is generated FROM the
+    /// library's own subtitle holdings, so counting it as coverage is
+    /// circular — and it vanishes if yap's pipeline retracts it (Taste of
+    /// Tea). Both still list in `tracks` output; they just don't satisfy a
+    /// subtitle-language requirement.
+    pub fn covers(&self, lang: &str) -> bool {
+        self.lang == lang && !self.forced && !self.yap
+    }
 }
 
 fn which_ffprobe() -> Option<String> {
@@ -1224,9 +1243,24 @@ fn sidecar_subs(path: &str) -> Vec<Track> {
             codec: Some(format!("sidecar-{}", parts.last().copied().unwrap_or(""))),
             default: false,
             forced: parts.contains(&"forced"),
+            yap: parts.contains(&"yap"),
         });
     }
     out
+}
+
+/// Is this ffprobe stream a forced (signs-only) subtitle track?
+///
+/// The disposition flag when the muxer set it — but plenty of discs mark
+/// forced tracks only in the stream title (Gramps Is in the Resistance:
+/// disposition.forced=0, title="Forced"), so the name counts too.
+pub fn stream_is_forced(st: &Value) -> bool {
+    truthy(st.at(&["disposition", "forced"]))
+        || st
+            .at(&["tags", "title"])
+            .as_str()
+            .map(|t| t.to_lowercase().contains("forced"))
+            .unwrap_or(false)
 }
 
 /// (audio_tracks, sub_tracks, readable) for one video file.
@@ -1239,7 +1273,8 @@ pub fn file_tracks(path: &str) -> (Vec<Track>, Vec<Track>, bool) {
                 lang: norm_lang(st.at(&["tags", "language"]).as_str().unwrap_or("")),
                 codec: st.get("codec_name").and_then(|v| v.as_str()).map(String::from),
                 default: truthy(st.at(&["disposition", "default"])),
-                forced: truthy(st.at(&["disposition", "forced"])),
+                forced: st.s("codec_type") == "subtitle" && stream_is_forced(st),
+                yap: false,
             };
             match st.s("codec_type") {
                 "audio" => audio.push(ent),
@@ -1301,10 +1336,12 @@ fn fmt_tracks(tr: &[Track]) -> String {
         .iter()
         .map(|t| {
             format!(
-                "{}{}({})",
+                "{}{}({}{}{})",
                 t.lang,
                 if t.default { "*" } else { "" },
-                t.codec.as_deref().unwrap_or("None")
+                t.codec.as_deref().unwrap_or("None"),
+                if t.forced { ",forced" } else { "" },
+                if t.yap { ",yap" } else { "" },
             )
         })
         .collect::<Vec<_>>()
@@ -1353,11 +1390,12 @@ fn py_json_str(s: &str) -> String {
 fn dump_track(t: &Track, ind: usize) -> String {
     let p = " ".repeat(ind);
     format!(
-        "{p}{{\n{p}  \"lang\": {},\n{p}  \"codec\": {},\n{p}  \"default\": {},\n{p}  \"forced\": {}\n{p}}}",
+        "{p}{{\n{p}  \"lang\": {},\n{p}  \"codec\": {},\n{p}  \"default\": {},\n{p}  \"forced\": {},\n{p}  \"yap\": {}\n{p}}}",
         py_json_str(&t.lang),
         t.codec.as_deref().map(py_json_str).unwrap_or_else(|| "null".into()),
         t.default,
         t.forced,
+        t.yap,
         p = p
     )
 }
@@ -1429,7 +1467,7 @@ pub fn cmd_tracks(svc: &str, args: &[String]) {
             .unwrap_or(false);
         let miss_s = want_s
             .as_deref()
-            .map(|w| !subs.iter().any(|t| t.lang == w))
+            .map(|w| !subs.iter().any(|t| t.covers(w)))
             .unwrap_or(false);
         if (want_a.is_some() || want_s.is_some()) && !(miss_a || miss_s) {
             continue;
