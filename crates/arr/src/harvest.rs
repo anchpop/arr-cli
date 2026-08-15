@@ -507,7 +507,7 @@ fn try_fallback(mid: i64, lang: &str, dry: bool) {
         }
     }
     fallbacks_store(&key, &chain);
-    println!("  fallback chain exhausted — film goes to the provider/retry path");
+    println!("  fallback chain exhausted — no more pre-picked releases for this movie");
 }
 
 fn now_iso() -> String {
