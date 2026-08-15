@@ -421,8 +421,19 @@ fn collect(dry: bool) {
         let outcome = harvest_payload(mid, &name_lang, &storage, dry);
         if !dry {
             record_outcome(mid, &name_lang, name, &outcome);
-            sab_delete_history(&nzo); // del_files=1 — the payload video is never kept
-            println!("  payload deleted (SAB history + files)");
+            // Fail closed: only delete a payload we actually probed. An
+            // "empty"/unroutable outcome may be a bug on our side (2026-08-14:
+            // storage pointed at the file, not the dir, and a good payload was
+            // deleted unprobed) — leave it for the next run / manual look.
+            let probed = outcome.starts_with("harvested")
+                || outcome.starts_with("no-")
+                || outcome == "already-satisfied";
+            if probed {
+                sab_delete_history(&nzo); // del_files=1 — the payload video is never kept
+                println!("  payload deleted (SAB history + files)");
+            } else {
+                println!("  payload KEPT (outcome: {}) — will retry next --collect", outcome);
+            }
         }
         if outcome.starts_with("harvested") {
             harvested_any = true;
@@ -600,7 +611,14 @@ fn extract_streams(video: &str, subs: &[&Value], lang: &str, dest: &str, dry: bo
 
 fn payload_videos(dir: &str) -> Vec<String> {
     let mut out = vec![];
-    let mut stack = vec![dir.to_string()];
+    // SAB's history `storage` sometimes points at the payload FILE itself
+    // (single-file jobs), not the job directory — walk the parent then.
+    let root = if std::path::Path::new(dir).is_file() {
+        dir.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_else(|| dir.to_string())
+    } else {
+        dir.to_string()
+    };
+    let mut stack = vec![root];
     while let Some(d) = stack.pop() {
         let entries = match std::fs::read_dir(&d) {
             Ok(e) => e,
