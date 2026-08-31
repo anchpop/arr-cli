@@ -196,6 +196,53 @@ pub fn bazarr_api(
     }
 }
 
+/// Bindery (book automation, X-Api-Key, arr-style /api/v1). Always target
+/// 127.0.0.1 — bindery itself must avoid `localhost` (::1-only resolution),
+/// and we stay consistent with that convention.
+pub fn bindery_api(
+    method: &str,
+    path: &str,
+    params: &[(&str, &str)],
+    timeout: u64,
+    soft: bool,
+) -> Option<Value> {
+    let qs = if params.is_empty() { String::new() } else { format!("?{}", form_encode(params)) };
+    let url = format!("http://127.0.0.1:{}/api/v1{}{}", crate::BINDERY_PORT, path, qs);
+    let req = agent().request(method, &url).set("X-Api-Key", &crate::env::bindery_key());
+    match run(req, None, timeout) {
+        Ok(v) => v,
+        Err(_) if soft => None,
+        Err(ApiError::Http { code, .. }) => die(&format!("bindery {} -> HTTP {}", path, code)),
+        Err(ApiError::Timeout) => die(&format!("bindery {} -> timed out", path)),
+        Err(ApiError::Net(reason)) => die(&format!("bindery {} -> {}", path, reason)),
+    }
+}
+
+/// Shelfmark (Anna's Archive downloader, /api, NO auth — AUTH_METHOD=none).
+/// `soft` returns None on any error; hard errors carry the response body
+/// because Shelfmark's error strings ARE the diagnosis (mirror rot etc.).
+pub fn shelfmark_api(
+    method: &str,
+    path: &str,
+    params: &[(&str, &str)],
+    body: Option<&Value>,
+    timeout: u64,
+    soft: bool,
+) -> Option<Value> {
+    let qs = if params.is_empty() { String::new() } else { format!("?{}", form_encode(params)) };
+    let url = format!("http://127.0.0.1:{}/api{}{}", crate::SHELFMARK_PORT, path, qs);
+    match run(agent().request(method, &url), body, timeout) {
+        Ok(v) => v,
+        Err(_) if soft => None,
+        Err(ApiError::Http { code, detail }) => {
+            let d: String = detail.chars().take(300).collect();
+            die(&format!("shelfmark {} -> HTTP {} {}", path, code, d))
+        }
+        Err(ApiError::Timeout) => die(&format!("shelfmark {} -> timed out", path)),
+        Err(ApiError::Net(reason)) => die(&format!("shelfmark {} -> {}", path, reason)),
+    }
+}
+
 /// qBittorrent WebUI (localhost auth bypass): form-encoded POST.
 pub fn qbit_post_form(path: &str, form: &[(&str, &str)]) -> Result<String, ApiError> {
     let url = format!("http://localhost:{}{}", crate::QBIT_PORT, path);

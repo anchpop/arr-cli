@@ -226,6 +226,15 @@ Bazarr (subtitle manager — covers MAIN sonarr + radarr; NOT sonarr-anime):
   Prefer Bazarr for subtitles (it holds the OpenSubtitles membership) over
   hand-rolled subliminal runs.
 
+Books (Bindery usenet + Shelfmark/Anna's Archive; outside the arrs entirely):
+  arr book add '<title|isbn>' [--author X] [--format epub] [--book-id ID]
+               [--no-wait] [--timeout SECS]
+        the whole pipeline: Jellyfin dedup check, edition resolve, usenet
+        probe, Anna's Archive release search, download, wait, Jellyfin
+        confirm. Ambiguous titles list candidates for --book-id. NB books
+        skip the download-notifier: DM the requester yourself when it lands.
+  arr book status                       Shelfmark + Bindery queue rollup
+
 Keys come from $ARR_API_KEY_<SVC> / $ARR_API_KEY_{SAB,JELLYFIN,SEERR} or the
 sops-rendered env file (%s). No sudo required."#;
 

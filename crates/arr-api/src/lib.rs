@@ -11,8 +11,11 @@ pub mod http;
 pub mod json;
 pub mod util;
 
-pub use env::{env_key, get_key, jf_key, sab_key, seerr_key};
-pub use http::{api, api_t, bazarr_api, jf_api, sab_api, seerr_api, try_api, ApiError};
+pub use env::{bindery_key, env_key, get_key, jf_key, sab_key, seerr_key};
+pub use http::{
+    api, api_t, bazarr_api, bindery_api, jf_api, sab_api, seerr_api, shelfmark_api, try_api,
+    ApiError,
+};
 pub use json::JsonExt;
 pub use util::{die, fmt_gb, gb, mb, parse_seasons, pop_flags, resolve_id, Flags};
 
@@ -37,3 +40,5 @@ pub const QBIT_PORT: u16 = 8080;
 pub const JELLYFIN_PORT: u16 = 8096;
 pub const SEERR_PORT: u16 = 5055;
 pub const BAZARR_PORT: u16 = 6767;
+pub const BINDERY_PORT: u16 = 8787;
+pub const SHELFMARK_PORT: u16 = 8084;

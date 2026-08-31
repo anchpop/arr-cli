@@ -474,7 +474,7 @@ pub fn jf_search_items(term: &str, limit: usize) -> Vec<Value> {
         &[
             ("searchTerm", term),
             ("Recursive", "true"),
-            ("IncludeItemTypes", "Movie,Series"),
+            ("IncludeItemTypes", "Movie,Series,Book,AudioBook"),
             ("Fields", "Path,ProviderIds"),
             ("Limit", limit.as_str()),
         ],

@@ -74,3 +74,7 @@ pub fn seerr_key() -> String {
 pub fn bazarr_key() -> String {
     env_key("BAZARR_API_KEY", "ARR_API_KEY_BAZARR")
 }
+
+pub fn bindery_key() -> String {
+    env_key("BINDERY_API_KEY", "ARR_API_KEY_BINDERY")
+}

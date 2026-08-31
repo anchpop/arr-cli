@@ -9,6 +9,7 @@
 use arr_api::die;
 
 mod acquire;
+mod book;
 mod browse;
 mod disk;
 mod harvest;
@@ -82,6 +83,12 @@ fn main() {
                 "raw" => integrations::bazarr_raw(args),
                 c => die(&format!("unknown bazarr command '{}'", c)),
             }
+        }
+        "book" => {
+            if rest.is_empty() {
+                die("book: need a command (add, status)");
+            }
+            book::dispatch(rest[0].as_str(), &rest[1..]);
         }
         "delete" => disk::cmd_delete_auto(&rest),
         "queue" => acquire::cmd_queue_overview(&rest),
