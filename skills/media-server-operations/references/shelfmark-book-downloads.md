@@ -31,7 +31,12 @@ curl -s -X POST -H 'Content-Type: application/json' \
 curl -s http://localhost:8084/api/status
 ```
 
-The finished file lands flat in `/data/media/books` as `bindery:media` and
+Shelfmark organizes the finished file itself (since 2026-09-01:
+`FILE_ORGANIZATION=organize`, template `{Author}/{Title} ({Year})/{Title} -
+{Author}` — matches the existing library layout, per-book folder so cover
+art works). Do NOT move/rename its output by hand, and do not build extra
+normalization tooling — the template in Shelfmark's Downloads settings is
+the one knob. The file lands under `/data/media/books` as `bindery:media` and
 Jellyfin's Books library sees it (realtime monitor; `arr jellyfin refresh`
 nudges, `arr jellyfin has '<title>'` confirms). AA slow-partner speed is
 ~1 MB/s — a 95 MB epub takes ~20 min; that's normal, not stuck.
@@ -58,8 +63,8 @@ values" hygiene from earlier troubleshooting does not apply to this.
   `curl -X PUT -H 'Content-Type: application/json' -d '{"AA_BASE_URL":"https://annas-archive.gl","AA_MIRROR_URLS":["https://annas-archive.gl","https://annas-archive.pk","https://annas-archive.gd"]}' http://localhost:8084/api/settings/mirrors`
   **Settings changes need a container restart to take effect** (the process
   caches config; the API's `requiresRestart:false` is wrong about this).
-  You have no polkit grant for `podman-shelfmark.service` — ask Andre to
-  restart it.
+  Hermes has a polkit grant for exactly this:
+  `systemctl restart podman-shelfmark.service` (added 2026-08-31).
 - **Same error even with live mirrors, on Shelfmark < 1.3.13** → every AA
   domain now puts `/search` behind a DDoS-Guard JS challenge; only ≥ 1.3.13
   falls back to the built-in bypasser for search. The image tag is pinned in
