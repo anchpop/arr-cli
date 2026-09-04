@@ -104,6 +104,22 @@ pub fn locate(q: &str) -> Result<Hit, String> {
     }
 }
 
+/// Every library item whose title is exactly `q` (case-insensitive), across
+/// services — the "two movies called Hope" case `where` reports side by side.
+pub fn locate_exact(q: &str) -> Vec<Hit> {
+    let ql = q.to_lowercase();
+    let mut cache: HashMap<&'static str, Vec<Value>> = HashMap::new();
+    let mut hits: Vec<Hit> = vec![];
+    for svc in ITEM_SVCS {
+        for item in title_hits(library(&mut cache, svc), &ql) {
+            if item.s("title").to_lowercase() == ql {
+                hits.push(Hit { svc, item });
+            }
+        }
+    }
+    hits
+}
+
 /// Commands whose first positional is an `<id|query>`, so they can run without
 /// a service prefix. Excludes multi-target (`watch`) and service-specific
 /// (`replace`, `parse`, `import`, `search`) commands.
@@ -209,19 +225,9 @@ fn seerr_lines(title: &str, item: Option<&Value>) -> Vec<String> {
             tmdb = first.i("id");
         }
     }
-    if tmdb == 0 && tvdb == 0 {
-        return vec![];
-    }
-    let data =
-        seerr_api("/request", &[("take", "300"), ("skip", "0"), ("sort", "added")], 60, true)
-            .unwrap_or(Value::Null);
     let mut out = vec![];
-    for r in data.a("results") {
+    for r in integrations::seerr_requests_for_ids(tmdb, tvdb) {
         let m = r.at(&["media"]);
-        let hit = (tmdb != 0 && m.i("tmdbId") == tmdb) || (tvdb != 0 && m.i("tvdbId") == tvdb);
-        if !hit {
-            continue;
-        }
         let by = match r.at(&["requestedBy"]).get("displayName").and_then(Value::as_str) {
             Some(n) => n.to_string(),
             None => "?".to_string(),
@@ -241,6 +247,69 @@ fn seerr_lines(title: &str, item: Option<&Value>) -> Vec<String> {
     out
 }
 
+/// Two or more library entries share the exact title (Hope 2026 vs Hope
+/// 2013). Dying "ambiguous" here hides the one thing worth seeing: which
+/// entry has the file and which one holds the Seerr request. Print both,
+/// and when they disagree, the rebind that reconciles them.
+fn where_same_title(q: &str, hits: &[Hit]) {
+    println!("{} — {} entries share this title", q, hits.len());
+    let mut next: Vec<String> = vec![];
+    let mut on_disk: Vec<&Hit> = vec![];
+    let mut requests_elsewhere: Vec<(i64, i64)> = vec![]; // (request id, tmdb)
+    for h in hits {
+        let it = &h.item;
+        let is_series = arr_api::is_series(h.svc);
+        let disk = if is_series {
+            let (_s, cov) = policy::series_coverage(h.svc, it.i("id"), Some(it));
+            let files: i64 = cov.iter().map(|c| c.files).sum();
+            let aired: i64 = cov.iter().filter(|c| c.season != 0).map(|c| c.aired).sum();
+            if files > 0 { on_disk.push(h); }
+            format!("{}/{} aired episodes", files, aired)
+        } else if it.b("hasFile") {
+            on_disk.push(h);
+            format!("on disk ({}GB)", fmt_gb(it.at(&["movieFile", "size"]).as_i64().unwrap_or(0)))
+        } else {
+            "no file".to_string()
+        };
+        println!(
+            "  {} #{} \"{}\" ({}) {}={} — {}",
+            h.svc,
+            it.i("id"),
+            it.s("title"),
+            year_of(it),
+            if is_series { "tvdb" } else { "tmdb" },
+            if is_series { it.i("tvdbId") } else { it.i("tmdbId") },
+            disk
+        );
+        let sl = seerr_lines(it.s("title"), Some(it));
+        for l in &sl {
+            println!("      seerr {}", l);
+        }
+        if !is_series && !it.b("hasFile") {
+            for r in integrations::seerr_requests_for_ids(it.i("tmdbId"), 0) {
+                requests_elsewhere.push((r.i("id"), it.i("tmdbId")));
+            }
+        }
+    }
+    // One entry has the file, another (file-less) one holds the request: the
+    // requester almost certainly meant the one that exists.
+    if on_disk.len() == 1 && !arr_api::is_series(on_disk[0].svc) {
+        let want = on_disk[0].item.i("tmdbId");
+        for (rid, _) in &requests_elsewhere {
+            next.push(format!(
+                "arr seerr rebind {} --tmdb {}   (request points at the file-less entry; rebind if they meant the one on disk)",
+                rid, want
+            ));
+        }
+    }
+    if next.is_empty() {
+        next.push("pick one: `arr where <id>` needs the service — `arr radarr status <id>` / `arr radarr files <id>`".into());
+    }
+    for (i, n) in next.iter().enumerate() {
+        println!("  {}{}", if i == 0 { "next       " } else { "           " }, n);
+    }
+}
+
 /// arr where <title> — the whole pipeline in one call: which service holds it,
 /// what is on disk, whether anything is downloading for it, the Seerr request
 /// state, Jellyfin visibility, and the command that moves it forward.
@@ -254,6 +323,11 @@ pub fn cmd_where(args: &[String]) {
     let located = locate(&q);
     if let Err(e) = &located {
         if e.starts_with("ambiguous") {
+            let same = locate_exact(&q);
+            if same.len() >= 2 {
+                where_same_title(&q, &same);
+                return;
+            }
             die(e);
         }
     }
@@ -267,10 +341,28 @@ pub fn cmd_where(args: &[String]) {
     let mut disk_files: i64 = 0;
     match &hit {
         None => {
-            println!("  library    not in radarr, sonarr or sonarr-anime");
-            next.push(format!(
-                "arr radarr add '{q}'   (or `arr sonarr add` / `arr sonarr-anime add` for a show)"
-            ));
+            // The pre-Radarr library: Jellyfin serves it from a folder no arr
+            // owns. `add` would search and grab an upgrade over that file.
+            if let Some((name, year, dir)) = policy::unmanaged_jf_movie(&q) {
+                let folder = std::path::Path::new(&dir)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| dir.clone());
+                println!(
+                    "  library    not in radarr — but Jellyfin serves \"{}\" ({}) from a folder radarr doesn't track",
+                    name, year
+                );
+                println!("  disk       {}", dir);
+                next.push(format!(
+                    "arr radarr adopt '{}' --yes   (tracks the existing file, unmonitored, no search — `add` would grab an upgrade over it)",
+                    folder
+                ));
+            } else {
+                println!("  library    not in radarr, sonarr or sonarr-anime");
+                next.push(format!(
+                    "arr radarr add '{q}'   (or `arr sonarr add` / `arr sonarr-anime add` for a show)"
+                ));
+            }
         }
         Some(h) => {
             let it = &h.item;
@@ -468,7 +560,13 @@ pub fn cmd_where(args: &[String]) {
                     }
                 }
             }
-            println!("  jellyfin   [{}] {}{}", it.s("Type"), it.s("Name"), extra);
+            println!(
+                "  jellyfin   [{}] {}{}  {}",
+                it.s("Type"),
+                it.s("Name"),
+                extra,
+                arr_api::jf_item_url(it.s("Id"))
+            );
         }
     }
 

@@ -11,10 +11,10 @@ pub mod http;
 pub mod json;
 pub mod util;
 
-pub use env::{bindery_key, env_key, get_key, jf_key, sab_key, seerr_key};
+pub use env::{bindery_key, env_key, get_key, jf_item_url, jf_key, jf_public_url, sab_key, seerr_key};
 pub use http::{
     api, api_t, bazarr_api, bindery_api, jf_api, sab_api, seerr_api, shelfmark_api, try_api,
-    ApiError,
+    try_seerr, ApiError,
 };
 pub use json::JsonExt;
 pub use util::{die, fmt_gb, gb, mb, parse_seasons, pop_flags, resolve_id, Flags};

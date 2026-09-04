@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use arr_api::json::items;
-use arr_api::{api, bazarr_api, die, jf_api, pop_flags, resolve_id, seerr_api, JsonExt};
+use arr_api::{api, bazarr_api, die, fmt_gb, jf_api, pop_flags, resolve_id, seerr_api, try_seerr, ApiError, JsonExt};
 
 // --- Python-compat rendering helpers -----------------------------------------
 
@@ -148,17 +148,19 @@ const MSTAT: &[(i64, &str)] =
 
 // --- Seerr -------------------------------------------------------------------
 
-fn title_cache() -> &'static Mutex<HashMap<(String, i64), Option<String>>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, i64), Option<String>>>> = OnceLock::new();
+fn details_cache() -> &'static Mutex<HashMap<(String, i64), Value>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, i64), Value>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn seerr_title(mtype: &str, tmdb: i64) -> Option<String> {
+/// Seerr's own tv/movie details for a tmdb id (cached per run; Null when
+/// Seerr can't resolve it).
+pub fn seerr_details(mtype: &str, tmdb: i64) -> Value {
     if tmdb == 0 {
-        return None;
+        return Value::Null;
     }
     let key = (mtype.to_string(), tmdb);
-    if let Some(hit) = title_cache().lock().unwrap().get(&key) {
+    if let Some(hit) = details_cache().lock().unwrap().get(&key) {
         return hit.clone();
     }
     let d = seerr_api(
@@ -168,10 +170,43 @@ fn seerr_title(mtype: &str, tmdb: i64) -> Option<String> {
         true,
     )
     .unwrap_or(Value::Null);
+    details_cache().lock().unwrap().insert(key, d.clone());
+    d
+}
+
+fn seerr_title(mtype: &str, tmdb: i64) -> Option<String> {
+    let d = seerr_details(mtype, tmdb);
     let field = if mtype == "tv" { "name" } else { "title" };
-    let t = d.get(field).and_then(Value::as_str).map(str::to_string);
-    title_cache().lock().unwrap().insert(key, t.clone());
-    t
+    d.get(field).and_then(Value::as_str).map(str::to_string)
+}
+
+/// Release year per Seerr's details ("?" when unknown).
+fn seerr_year(mtype: &str, tmdb: i64) -> String {
+    let d = seerr_details(mtype, tmdb);
+    let field = if mtype == "tv" { "firstAirDate" } else { "releaseDate" };
+    match d.get(field).and_then(Value::as_str).and_then(|s| s.split('-').next()) {
+        Some(y) if !y.is_empty() => y.to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Every non-declined Seerr request whose media matches the tmdb/tvdb id
+/// (empty when Seerr is unreachable — callers treat that as "no request").
+pub fn seerr_requests_for_ids(tmdb: i64, tvdb: i64) -> Vec<Value> {
+    if tmdb == 0 && tvdb == 0 {
+        return vec![];
+    }
+    let data = seerr_api("/request", &[("take", "300"), ("skip", "0"), ("sort", "added")], 60, true)
+        .unwrap_or(Value::Null);
+    data.a("results")
+        .iter()
+        .filter(|r| {
+            let m = r.at(&["media"]);
+            r.i("status") != 3
+                && ((tmdb != 0 && m.i("tmdbId") == tmdb) || (tvdb != 0 && m.i("tvdbId") == tvdb))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Title with arr.py's fallback chain: media.title, then a Seerr tv/movie
@@ -284,8 +319,10 @@ pub fn seerr_unfulfilled(args: &[String]) {
         .unwrap_or(Value::Null);
     let movies_resp = api("radarr", "GET", "/movie", None);
     let mut movies: HashMap<i64, Value> = HashMap::new();
+    let mut by_title: HashMap<String, Vec<Value>> = HashMap::new();
     for m in items(&movies_resp) {
         movies.insert(m.i("tmdbId"), m.clone());
+        by_title.entry(m.s("title").to_lowercase()).or_default().push(m.clone());
     }
     let mut series_by_tvdb: HashMap<i64, (String, Value)> = HashMap::new();
     for inst in ["sonarr", "sonarr-anime"] {
@@ -326,6 +363,29 @@ pub fn seerr_unfulfilled(args: &[String]) {
                     }
                     continue;
                 }
+            }
+            // The request's movie isn't on disk, but a same-title movie IS:
+            // the requester most likely picked the wrong search result (Seerr
+            // lists the popular new "Hope" above the 2013 one), and someone
+            // then fetched the right film by hand. A search for the requested
+            // tmdb would fetch the wrong film, so this row gets no --fix.
+            if let Some(twin) = wrong_title_twin(&by_title, &media_title(m), m.i("tmdbId")) {
+                let req_year = mv.map(|x| py_get_year(x)).unwrap_or_else(|| seerr_year("movie", m.i("tmdbId")));
+                out.push(base(
+                    format!(
+                        "wrong title? request is {} ({}) tmdb={}, but {} ({}) tmdb={} is on disk — `arr seerr rebind {} --tmdb {}` if that's the one they meant",
+                        media_title(m),
+                        req_year,
+                        m.i("tmdbId"),
+                        twin.s("title"),
+                        py_get_year(&twin),
+                        twin.i("tmdbId"),
+                        r.i("id"),
+                        twin.i("tmdbId")
+                    ),
+                    None,
+                ));
+                continue;
             }
             match mv {
                 Some(mv) => out.push(base(
@@ -465,6 +525,267 @@ pub fn seerr_unfulfilled(args: &[String]) {
     }
 }
 
+fn py_get_year(m: &Value) -> String {
+    match m.get("year").and_then(Value::as_i64) {
+        Some(y) if y > 0 => y.to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// A Radarr movie with the same title as `title`, a different tmdb id, and a
+/// file on disk — the "they asked for the other Hope" signature.
+fn wrong_title_twin(by_title: &HashMap<String, Vec<Value>>, title: &str, tmdb: i64) -> Option<Value> {
+    let twins: Vec<&Value> = by_title
+        .get(&title.to_lowercase())?
+        .iter()
+        .filter(|x| x.i("tmdbId") != tmdb && x.b("hasFile"))
+        .collect();
+    if twins.len() == 1 {
+        Some(twins[0].clone())
+    } else {
+        None
+    }
+}
+
+pub fn seerr_err(e: ApiError) -> String {
+    match e {
+        ApiError::Http { code, detail } => format!("HTTP {} {}", code, detail.chars().take(200).collect::<String>()),
+        ApiError::Timeout => "timed out".into(),
+        ApiError::Net(r) => r,
+    }
+}
+
+/// arr seerr rebind <request-id> --tmdb <id> [--yes]
+///
+/// Point a Seerr movie request at a different TMDB id, keeping the
+/// requester. Seerr can't edit a request's media, so this is
+/// re-request-then-delete: the new request is created first (as the same
+/// user; Seerr marks it completed on the spot when the movie is already
+/// available, otherwise its normal Radarr hand-off runs), then the old
+/// request goes, then its media row (when nothing else references it), and
+/// finally the wrong Radarr entry when it has no file — so the mis-pick
+/// can't quietly download months later when it releases.
+pub fn seerr_rebind(args: &[String]) {
+    let (flags, rest) = pop_flags(args, &[("--tmdb", 1), ("--yes", 0)]);
+    if rest.is_empty() {
+        die("seerr rebind: usage: arr seerr rebind <request-id> --tmdb <id> [--yes]");
+    }
+    let new_tmdb: i64 = flags
+        .val("--tmdb")
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|v: &i64| *v > 0)
+        .unwrap_or_else(|| die("seerr rebind: --tmdb <id> is required (find it with `arr radarr lookup '<title>'`)"));
+    let rid = rest[0].trim_start_matches('#');
+    let req = seerr_api(&format!("/request/{}", rid), &[], 60, false).unwrap_or(Value::Null);
+    if req.i("id") == 0 {
+        die(&format!("seerr rebind: no request #{}", rid));
+    }
+    rebind_request(&req, new_tmdb, flags.has("--yes"), true);
+}
+
+/// The rebind itself; `manage_radarr=false` when the caller already removed
+/// the wrong Radarr entry (`arr radarr replace`). Returns true when applied.
+pub fn rebind_request(req: &Value, new_tmdb: i64, go: bool, manage_radarr: bool) -> bool {
+    let m = req.at(&["media"]);
+    if req.s("type") != "movie" {
+        println!(
+            "seerr rebind: request #{} is a {} request — rebind handles movies only (re-request the show in the Seerr UI and delete this one)",
+            req.i("id"),
+            req.s("type")
+        );
+        return false;
+    }
+    let old_tmdb = m.i("tmdbId");
+    let by = requested_by(req);
+    let user_id = req.at(&["requestedBy"]).i("id");
+    if old_tmdb == new_tmdb {
+        println!("seerr rebind: request #{} already points at tmdb {}", req.i("id"), new_tmdb);
+        return false;
+    }
+    let new_d = seerr_details("movie", new_tmdb);
+    if new_d.s("title").is_empty() {
+        die(&format!("seerr rebind: Seerr can't resolve tmdb {}", new_tmdb));
+    }
+    let new_info = new_d.at(&["mediaInfo"]);
+    let new_avail = new_info.i("status") == 5;
+    // A live request for the target already exists (Seerr would 409):
+    // report it and stop before touching anything.
+    let live: Vec<&Value> = new_info.a("requests").iter().filter(|r| r.i("status") != 3).collect();
+    if let Some(r) = live.first() {
+        println!(
+            "seerr rebind: {} ({}) tmdb={} already has request #{} (by {}) — delete #{} in Seerr instead, nothing to rebind",
+            new_d.s("title"),
+            seerr_year("movie", new_tmdb),
+            new_tmdb,
+            r.i("id"),
+            r.at(&["requestedBy"]).get("displayName").and_then(Value::as_str).unwrap_or("?"),
+            req.i("id")
+        );
+        return false;
+    }
+    let old_title = media_title(m);
+    let mut old_year = seerr_year("movie", old_tmdb);
+    // Radarr side: the wrong entry and the right one.
+    let movies = items(&api("radarr", "GET", "/movie", None)).to_vec();
+    let old_mv = movies.iter().find(|x| x.i("tmdbId") == old_tmdb).cloned();
+    let new_mv = movies.iter().find(|x| x.i("tmdbId") == new_tmdb).cloned();
+    if let Some(x) = &old_mv {
+        old_year = py_get_year(x);
+    }
+    let old_media_requests = seerr_details("movie", old_tmdb)
+        .at(&["mediaInfo"])
+        .a("requests")
+        .iter()
+        .filter(|r| r.i("id") != req.i("id") && r.i("status") != 3)
+        .count();
+    let old_has_file = old_mv.as_ref().map(|x| x.b("hasFile")).unwrap_or(false);
+    let drop_old_media = old_media_requests == 0 && !old_has_file;
+    let drop_old_radarr = manage_radarr && old_mv.is_some() && drop_old_media;
+
+    println!(
+        "{}REBIND request #{} by {}: {} ({}) tmdb={} → {} ({}) tmdb={}",
+        if go { "" } else { "[dry-run] " },
+        req.i("id"),
+        by,
+        old_title,
+        old_year,
+        old_tmdb,
+        new_d.s("title"),
+        seerr_year("movie", new_tmdb),
+        new_tmdb
+    );
+    println!(
+        "  seerr    re-request tmdb {} as {} ({}), then delete request #{}{}",
+        new_tmdb,
+        by,
+        if new_avail {
+            "already available — Seerr completes it on the spot"
+        } else {
+            "not available yet — Seerr hands it to Radarr as usual"
+        },
+        req.i("id"),
+        if drop_old_media {
+            " and its media row".to_string()
+        } else if old_has_file {
+            format!(" (media row stays: Radarr has a file for tmdb {})", old_tmdb)
+        } else {
+            format!(" (media row stays: {} other request(s) on it)", old_media_requests)
+        }
+    );
+    match &old_mv {
+        Some(x) if drop_old_radarr => println!(
+            "  radarr   delete [{}] {} ({}) — no file, nothing else wants it",
+            x.i("id"),
+            x.s("title"),
+            py_get_year(x)
+        ),
+        Some(x) => println!(
+            "  radarr   [{}] {} ({}) stays ({})",
+            x.i("id"),
+            x.s("title"),
+            py_get_year(x),
+            if !manage_radarr {
+                "handled by the caller"
+            } else if old_has_file {
+                "has a file"
+            } else {
+                "other requests reference it"
+            }
+        ),
+        None => println!("  radarr   tmdb {} not in radarr — nothing to remove", old_tmdb),
+    }
+    match &new_mv {
+        Some(x) => println!(
+            "  radarr   [{}] {} ({}) — {}",
+            x.i("id"),
+            x.s("title"),
+            py_get_year(x),
+            if x.b("hasFile") { format!("on disk ({}GB)", fmt_gb(x.i("sizeOnDisk"))) } else { "no file yet".into() }
+        ),
+        None => println!("  radarr   tmdb {} not in radarr yet — Seerr's approval adds it", new_tmdb),
+    }
+    if !go {
+        println!("  (pass --yes to apply)");
+        return false;
+    }
+
+    // 1. new request first — if this fails nothing has been deleted.
+    let body = json!({"mediaType": "movie", "mediaId": new_tmdb, "userId": user_id, "is4k": false});
+    let created = match try_seerr("POST", "/request", Some(&body), 120) {
+        Ok(v) => v.unwrap_or(Value::Null),
+        Err(e) => die(&format!("seerr rebind: creating the new request failed ({}) — nothing changed", seerr_err(e))),
+    };
+    let new_req = seerr_api(&format!("/request/{}", created.i("id")), &[], 60, true).unwrap_or(created.clone());
+    println!(
+        "  created request #{} by {} — {} (media {})",
+        new_req.i("id"),
+        requested_by(&new_req),
+        py_str(&stat_value(RSTAT, new_req.at(&["status"]))),
+        py_str(&stat_value(MSTAT, new_req.at(&["media", "status"])))
+    );
+    // 2. old request, then its media row.
+    match try_seerr("DELETE", &format!("/request/{}", req.i("id")), None, 60) {
+        Ok(_) => println!("  deleted request #{}", req.i("id")),
+        Err(e) => println!("  ⚠ deleting request #{} failed ({}) — remove it in the Seerr UI", req.i("id"), seerr_err(e)),
+    }
+    if drop_old_media && m.i("id") != 0 {
+        match try_seerr("DELETE", &format!("/media/{}", m.i("id")), None, 60) {
+            Ok(_) => println!("  deleted media row {} (tmdb {})", m.i("id"), old_tmdb),
+            Err(e) => println!("  ⚠ deleting media row {} failed ({})", m.i("id"), seerr_err(e)),
+        }
+    }
+    // 3. the wrong Radarr entry.
+    if let Some(x) = &old_mv {
+        if drop_old_radarr {
+            api(
+                "radarr",
+                "DELETE",
+                &format!("/movie/{}?deleteFiles=false&addImportExclusion=false", x.i("id")),
+                None,
+            );
+            println!("  deleted radarr [{}] {} ({})", x.i("id"), x.s("title"), py_get_year(x));
+        }
+        // requester/require-* tags belong with the film they actually meant.
+        if let Some(nm) = &new_mv {
+            carry_tags(x, nm);
+        }
+    }
+    true
+}
+
+/// Move `requester-*` / `require-*` tags from one Radarr movie to another.
+fn carry_tags(from: &Value, to: &Value) {
+    if from.a("tags").is_empty() {
+        return;
+    }
+    let all: HashMap<i64, String> = items(&api("radarr", "GET", "/tag", None))
+        .iter()
+        .map(|t| (t.i("id"), t.s("label").to_string()))
+        .collect();
+    let carry: Vec<i64> = from
+        .a("tags")
+        .iter()
+        .filter_map(Value::as_i64)
+        .filter(|tid| {
+            all.get(tid)
+                .map(|l| l.starts_with("requester-") || l.starts_with("require-"))
+                .unwrap_or(false)
+        })
+        .filter(|tid| !to.a("tags").iter().filter_map(Value::as_i64).any(|t| t == *tid))
+        .collect();
+    if carry.is_empty() {
+        return;
+    }
+    api(
+        "radarr",
+        "PUT",
+        "/movie/editor",
+        Some(&json!({"movieIds": [to.i("id")], "tags": carry, "applyTags": "add"})),
+    );
+    let labels: Vec<&str> = carry.iter().filter_map(|t| all.get(t).map(String::as_str)).collect();
+    println!("  carried tag(s) {} to [{}] {}", labels.join(", "), to.i("id"), to.s("title"));
+}
+
 // --- Jellyfin ----------------------------------------------------------------
 
 pub fn jf_search_items(term: &str, limit: usize) -> Vec<Value> {
@@ -517,6 +838,7 @@ pub fn cmd_jf_has(args: &[String]) {
         if !it.s("Path").is_empty() {
             println!("      {}", it.s("Path"));
         }
+        println!("      {}", arr_api::jf_item_url(it.s("Id")));
     }
 }
 

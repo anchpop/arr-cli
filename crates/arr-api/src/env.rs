@@ -78,3 +78,19 @@ pub fn bazarr_key() -> String {
 pub fn bindery_key() -> String {
     env_key("BINDERY_API_KEY", "ARR_API_KEY_BINDERY")
 }
+
+/// Public Jellyfin URL for deep links (the Caddy vhost). Override with
+/// JELLYFIN_PUBLIC_URL.
+pub fn jf_public_url() -> String {
+    std::env::var("JELLYFIN_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://watch.beef.baby".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// Web-client deep link to an item (movie / series / episode) by Jellyfin id.
+pub fn jf_item_url(id: &str) -> String {
+    format!("{}/web/#/details?id={}", jf_public_url(), id)
+}

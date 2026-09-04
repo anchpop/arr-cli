@@ -2,7 +2,7 @@
 //! Seerr, Jellyfin) plus queue aggregation. `fetch_item` is the type-driven
 //! arr_item_gone: Ok(None) is a DEFINITIVE 404, Err is transient.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -165,7 +165,8 @@ pub fn trigger_jellyfin_scan() {
 
 struct JfCache {
     t: f64,
-    movies: Option<HashSet<String>>,
+    /// "tmdb:123" / "imdb:tt…" → Jellyfin item id
+    movies: Option<HashMap<String, String>>,
     series: HashMap<String, String>, // provider key -> jellyfin series id
 }
 
@@ -187,7 +188,7 @@ fn jf_refresh() {
             return;
         }
     }
-    let mut movies = HashSet::new();
+    let mut movies = HashMap::new();
     let md = jf_get(
         "/Items",
         &[
@@ -203,7 +204,10 @@ fn jf_refresh() {
             for k in ["Tmdb", "Imdb"] {
                 let v = truthy_scalar_str(pid.get(k));
                 if !v.is_empty() {
-                    movies.insert(format!("{}:{}", k.to_lowercase(), v.to_lowercase()));
+                    movies.insert(
+                        format!("{}:{}", k.to_lowercase(), v.to_lowercase()),
+                        it.s("Id").to_string(),
+                    );
                 }
             }
         }
@@ -243,14 +247,36 @@ fn jf_refresh() {
 }
 
 pub fn jf_has_movie(tmdb: &str, imdb: &str) -> bool {
+    jf_movie_id(tmdb, imdb).is_some()
+}
+
+/// Jellyfin item id of the movie with this tmdb/imdb id, if scanned in.
+pub fn jf_movie_id(tmdb: &str, imdb: &str) -> Option<String> {
     jf_refresh();
     let c = jf_cache().lock().unwrap();
-    let have = c.movies.as_ref();
-    let chk = |k: &str, v: &str| {
-        !v.is_empty()
-            && have.map_or(false, |h| h.contains(&format!("{}:{}", k, v.to_lowercase())))
-    };
-    chk("tmdb", tmdb) || chk("imdb", imdb)
+    let have = c.movies.as_ref()?;
+    for (k, v) in [("tmdb", tmdb), ("imdb", imdb)] {
+        if !v.is_empty() {
+            if let Some(id) = have.get(&format!("{}:{}", k, v.to_lowercase())) {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Jellyfin item id of the series with any of these provider ids.
+pub fn jf_series_id(tvdb: &str, tmdb: &str, imdb: &str) -> Option<String> {
+    jf_refresh();
+    let c = jf_cache().lock().unwrap();
+    for (k, v) in [("tvdb", tvdb), ("tmdb", tmdb), ("imdb", imdb)] {
+        if !v.is_empty() {
+            if let Some(id) = c.series.get(&format!("{}:{}", k, v.to_lowercase())) {
+                return Some(id.clone());
+            }
+        }
+    }
+    None
 }
 
 /// How many episodes Jellyfin currently has for this series (0 if the series

@@ -22,7 +22,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::arrs::{
-    aggregate_queue, arr_get, episode_hasfile_map, err_str, fetch_item, jf_has_movie,
+    aggregate_queue, arr_get, episode_hasfile_map, err_str, fetch_item, jf_has_movie, jf_movie_id,
+    jf_series_id,
     jf_series_episode_count, seerr_get, trigger_jellyfin_scan, Group,
 };
 use crate::config::{
@@ -330,16 +331,48 @@ fn handle(con: &Connection, key: &str, discord_id: &str, title: &str, g: &Group)
     // upgrade runs to completion invisibly.
     let phase = row.as_ref().and_then(|r| r.3.clone()).unwrap_or_default();
     if row.is_none() || phase == "done" || phase == "importing" {
+        // The guard needs a definite answer. On an arr API error, skip this
+        // poll instead of falling through: a Radarr timeout here once turned an
+        // upgrade-only Iron Man remux into a progress DM at 84% (2026-09-03).
         let already_watchable = if kind == "movie" {
-            matches!(fetch_item(&instn, "movie", &iid_str), Ok(Some(m)) if m.b("hasFile"))
+            match fetch_item(&instn, "movie", &iid_str) {
+                Ok(Some(m)) => m.b("hasFile"),
+                Ok(None) => false,
+                Err(e) => {
+                    log(&format!(
+                        "WARN {} GET movie/{} failed ({}) — upgrade check deferred for {:?}",
+                        instn,
+                        iid_str,
+                        err_str(&e),
+                        title
+                    ));
+                    return;
+                }
+            }
+        } else if g.episodes.is_empty() {
+            false
         } else {
-            !g.episodes.is_empty()
-                && episode_hasfile_map(&instn, &iid_str).is_some_and(|m| {
-                    g.episodes
-                        .iter()
-                        .all(|(s, e)| m.get(&format!("{}x{}", s, e)).copied().unwrap_or(false))
-                })
+            match episode_hasfile_map(&instn, &iid_str) {
+                Some(m) => g
+                    .episodes
+                    .iter()
+                    .all(|(s, e)| m.get(&format!("{}x{}", s, e)).copied().unwrap_or(false)),
+                None => {
+                    log(&format!(
+                        "WARN {} episode file map unavailable — upgrade check deferred for {:?}",
+                        instn, title
+                    ));
+                    return;
+                }
+            }
         };
+        // A never-DM'd 'done' row is the upgrade-only marker. When the upgrade
+        // imports, Radarr deletes the old file a beat before the new one lands,
+        // so hasFile reads false for a poll while the queue item is importing:
+        // that's the swap, not a re-download.
+        if !already_watchable && phase == "done" && mid.is_none() && importing {
+            return;
+        }
         if already_watchable {
             if row.is_none() {
                 let _ = con.execute(
@@ -955,6 +988,15 @@ fn confirm_imported(con: &Connection) {
                 .unwrap_or("")
                 .to_string();
             payload["embeds"][0]["description"] = json!(format!("{}\n{}", d, dv5));
+        }
+        // The embed title links straight to the item in the Jellyfin web client.
+        let jf_id = if r.kind == "movie" {
+            jf_movie_id(&r.tmdb, &r.imdb)
+        } else {
+            jf_series_id(&r.tvdb, &r.tmdb, &r.imdb)
+        };
+        if let Some(id) = jf_id {
+            payload["embeds"][0]["url"] = json!(arr_api::jf_item_url(&id));
         }
         if cfg().dry_run {
             log(&format!("DRY would mark ready {}: {}", r.discord_id, title));

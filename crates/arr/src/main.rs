@@ -61,13 +61,14 @@ fn main() {
         }
         "seerr" => {
             if rest.is_empty() {
-                die("seerr: requests|request|unfulfilled");
+                die("seerr: requests|request|unfulfilled|rebind");
             }
             let args = &rest[1..];
             match rest[0].as_str() {
                 "requests" => integrations::seerr_requests(args),
                 "request" => integrations::seerr_request(args),
                 "unfulfilled" => integrations::seerr_unfulfilled(args),
+                "rebind" => integrations::seerr_rebind(args),
                 c => die(&format!("unknown seerr command '{}'", c)),
             }
         }
@@ -146,6 +147,7 @@ pub fn run_svc_command(svc: &str, cmd: &str, args: &[String]) {
                 "tag" => browse::cmd_tag(svc, args),
                 "raw" => browse::cmd_raw(svc, args),
                 "add" => policy::cmd_add(svc, args),
+                "adopt" => policy::cmd_adopt(svc, args),
                 "coverage" => policy::cmd_coverage(svc, args),
                 "tracks" => policy::cmd_tracks(svc, args),
                 "watch" => policy::cmd_watch(svc, args),

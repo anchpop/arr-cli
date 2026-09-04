@@ -14,7 +14,7 @@ instance returns "no match", which reads exactly like "not in the library" —
 the usual reason a lookup turns into a six-command hunt. Anime lives on
 sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
   works for: status get seasons releases grab monitor episodes history files
-             audit availability info tag coverage tracks
+             audit availability info tag coverage tracks adopt
   put the TITLE FIRST, flags after it. A numeric id still needs its service
   (ids are only unique within one instance). Ambiguous titles list candidates.
 
@@ -67,6 +67,15 @@ Commands (sonarr & radarr unless noted):
   replace <old id|query> <correct title...> [--tmdb ID] [--year Y] [--yes]  (radarr)
         delete wrong movie+file, add the right one, carry requester tag, search.
         dry-run unless --yes (the German-Les-Visiteurs fix)
+  adopt [<folder substring>|--all] [--tmdb ID] [--monitored] [--yes]  (radarr)
+        take a movie folder Radarr doesn't own (the pre-Radarr library that
+        Jellyfin already serves) into Radarr as-is: unmonitored, no search, the
+        existing file assigned. Folder "Title (Year)" is matched to TMDB by
+        exact title + year; ambiguous/unmatched folders are listed with the
+        `--tmdb` rerun. No args = list the unmanaged folders. Dry-run unless
+        --yes. `add` does this by itself when its pick is such a folder, and
+        `where` points here — a plain add would search and grab an "upgrade"
+        over a file that's already watchable (the Iron Man remux, 2026-09-03).
   get <id|query>                  full JSON for one item
   seasons <id|query>              (sonarr) per-season monitored + on-disk
   releases <id|query> [--season N|--episode EPID] [--audio eng|dual] [--timeout S]
@@ -216,7 +225,12 @@ Jellyfin / Seerr:
   arr seerr request <id>                     full request detail
   arr seerr unfulfilled [--fix] [--json] [--quiet]   requests vs ACTUAL disk state
         (cross-checked against the arrs; flags Seerr-says-partial-but-complete
-        divergences; --fix triggers arr-side searches for real gaps)
+        divergences and "wrong title?" rows where a same-title movie under a
+        different tmdb is on disk; --fix triggers arr-side searches for real gaps)
+  arr seerr rebind <request-id> --tmdb <id> [--yes]   point a movie request at
+        the film the requester actually meant (same requester; re-request +
+        delete, drops the wrong Radarr entry when it has no file). Dry-run
+        unless --yes.
 
 Bazarr (subtitle manager — covers MAIN sonarr + radarr; NOT sonarr-anime):
   arr bazarr status                     provider health/throttles + wanted backlog

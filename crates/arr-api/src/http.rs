@@ -260,6 +260,20 @@ pub fn qbit_post_form(path: &str, form: &[(&str, &str)]) -> Result<String, ApiEr
     }
 }
 
+/// Seerr (X-Api-Key), any method, fallible — for the mutating verbs
+/// (`seerr rebind`) that must decide per status code (409 duplicate is
+/// informational, not fatal).
+pub fn try_seerr(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: u64,
+) -> Result<Option<Value>, ApiError> {
+    let url = format!("http://localhost:{}/api/v1{}", SEERR_PORT, path);
+    let req = agent().request(method, &url).set("X-Api-Key", &seerr_key());
+    run(req, body, timeout)
+}
+
 /// Seerr (X-Api-Key), GET only.
 pub fn seerr_api(path: &str, params: &[(&str, &str)], timeout: u64, soft: bool) -> Option<Value> {
     let qs = if params.is_empty() { String::new() } else { format!("?{}", form_encode(params)) };

@@ -616,17 +616,87 @@ fn existing_by_ids_r(
             return Ok(Some(it.clone()));
         }
     }
-    if let Some(title) = title {
-        let tl = title.to_lowercase();
-        let exact: Vec<&Value> = list
-            .iter()
-            .filter(|it| it.s("title").to_lowercase() == tl)
-            .collect();
-        if exact.len() == 1 {
-            return Ok(Some(exact[0].clone()));
+    // Title fallback only when we have no id to go by. With an id in hand, a
+    // same-title entry under a different id is a different film — treating
+    // Hope (2026) as "already added" for a Hope (2013) request stamped the
+    // requester tag on the wrong movie (2026-09-03).
+    if tvdb == 0 && tmdb == 0 {
+        if let Some(title) = title {
+            let tl = title.to_lowercase();
+            let exact: Vec<&Value> = list
+                .iter()
+                .filter(|it| it.s("title").to_lowercase() == tl)
+                .collect();
+            if exact.len() == 1 {
+                return Ok(Some(exact[0].clone()));
+            }
         }
     }
     Ok(None)
+}
+
+/// Library entries sharing the pick's exact title under a different id.
+fn same_title_others(svc: &str, pick: &Value) -> Vec<Value> {
+    let coll = if svc.starts_with("sonarr") { "series" } else { "movie" };
+    let resp = api(svc, "GET", &format!("/{}", coll), None);
+    let tl = pick.s("title").to_lowercase();
+    let (tvdb, tmdb) = (pick.i("tvdbId"), pick.i("tmdbId"));
+    items(&resp)
+        .iter()
+        .filter(|it| it.s("title").to_lowercase() == tl)
+        .filter(|it| !(tvdb != 0 && it.i("tvdbId") == tvdb) && !(tmdb != 0 && it.i("tmdbId") == tmdb))
+        .cloned()
+        .collect()
+}
+
+/// `add` is the moment a wrong-pick is cheapest to catch: the same title is
+/// already in the library under another id, and a Seerr request (or a
+/// requester tag) sits on that entry. Say so, and print the rebind.
+fn warn_same_title(svc: &str, pick: &Value) {
+    let others = same_title_others(svc, pick);
+    if others.is_empty() {
+        return;
+    }
+    let is_series = svc.starts_with("sonarr");
+    for o in &others {
+        let disk = if is_series {
+            "".to_string()
+        } else if o.b("hasFile") {
+            format!(" — on disk ({}GB)", fmt_gb(o.i("sizeOnDisk")))
+        } else {
+            " — no file".to_string()
+        };
+        println!(
+            "⚠ same title already in {}: [{}] {} ({}) {}={}{}",
+            svc,
+            o.i("id"),
+            o.s("title"),
+            py_get(o, "year"),
+            if is_series { "tvdb" } else { "tmdb" },
+            if is_series { o.i("tvdbId") } else { o.i("tmdbId") },
+            disk
+        );
+        let reqs = crate::integrations::seerr_requests_for_ids(
+            if is_series { 0 } else { o.i("tmdbId") },
+            if is_series { o.i("tvdbId") } else { 0 },
+        );
+        for r in &reqs {
+            let by = r.at(&["requestedBy"]).get("displayName").and_then(Value::as_str).unwrap_or("?");
+            println!("    Seerr request #{} by {} points at that entry", r.i("id"), by);
+            // An entry with a file satisfies its request legitimately; the
+            // rebind only makes sense when the request sits on a file-less one.
+            if !is_series && !o.b("hasFile") {
+                println!(
+                    "    if they meant this one: arr seerr rebind {} --tmdb {}   (moves the request, drops the file-less entry)",
+                    r.i("id"),
+                    pick.i("tmdbId")
+                );
+            }
+        }
+        if reqs.is_empty() && !is_series && !o.b("hasFile") {
+            println!("    nothing requests it — `arr radarr delete {} --yes` if it was a mis-pick", o.i("id"));
+        }
+    }
 }
 
 fn existing_by_ids(svc: &str, tvdb: i64, tmdb: i64, title: Option<&str>) -> Option<Value> {
@@ -922,6 +992,11 @@ pub fn cmd_add(svc: &str, args: &[String]) {
                     format!("no file yet — `arr radarr grab {}` re-searches", existing.i("id"))
                 }
             );
+            if existing.b("hasFile") {
+                if let Some(w) = jf_watch_line(existing.s("path")) {
+                    println!("{}", w);
+                }
+            }
             crate::browse::audit_warn(svc, existing.i("id"), Some(&existing));
         }
         return;
@@ -941,6 +1016,44 @@ pub fn cmd_add(svc: &str, args: &[String]) {
             return;
         }
     }
+    // The pre-Radarr library: Jellyfin already serves this film from a folder
+    // Radarr doesn't own. A fresh add would search and grab an "upgrade" over
+    // the file that's already there (Iron Man, 2026-09-03: 63GB remux
+    // re-downloaded + re-encoded for a film that was watchable all along).
+    // Adopt the folder instead — tracked, unmonitored, no search.
+    if !is_series {
+        let movies = items(&api(svc, "GET", "/movie", None)).to_vec();
+        if let Some(dir) = unmanaged_folder_for(&pick, &movies) {
+            println!(
+                "already watchable: Jellyfin serves {} ({}) from a folder radarr doesn't track: {}",
+                py_get(&pick, "title"),
+                py_get(&pick, "year"),
+                dir
+            );
+            if flags.has("--dry-run") {
+                println!("DRY: would adopt that folder (unmonitored, no search) instead of adding");
+                return;
+            }
+            println!("adopting it instead of adding — an add would search and grab an \"upgrade\" over the file already there");
+            let (pid, _, root) = profile_and_root(svc, flags.val("--quality"), flags.val("--root"));
+            let plan = AdoptPlan {
+                dir: dir.clone(),
+                bytes: dir_video_bytes(&dir),
+                pick: Some(pick.clone()),
+                cands: vec![],
+            };
+            if let Some(created) = adopt_one(&plan, &pick, false, pid, &root) {
+                stamp_add_tags(svc, created.i("id"), &flags);
+                println!(
+                    "  ready to watch now — nothing to download. `arr radarr monitor {} on` + `arr radarr grab {}` only if they want the profile to hunt for a better release",
+                    created.i("id"),
+                    created.i("id")
+                );
+            }
+            return;
+        }
+    }
+    warn_same_title(svc, &pick);
     if flags.has("--dry-run") {
         let ids = if is_series {
             format!("tvdb={}", py_get(&pick, "tvdbId"))
@@ -1012,6 +1125,11 @@ pub fn cmd_replace(svc: &str, args: &[String]) {
         py_get(&pick, "year"),
         py_get(&pick, "tmdbId")
     );
+    let seerr_reqs = crate::integrations::seerr_requests_for_ids(old.i("tmdbId"), 0);
+    for r in &seerr_reqs {
+        let by = r.at(&["requestedBy"]).get("displayName").and_then(Value::as_str).unwrap_or("?");
+        println!("    Seerr request #{} by {} points at the old movie — it moves to the new one", r.i("id"), by);
+    }
     if !go {
         println!("  (pass --yes to delete the old movie + file and add the new one)");
         return;
@@ -1049,6 +1167,10 @@ pub fn cmd_replace(svc: &str, args: &[String]) {
             Some(&json!({"movieIds": [created.i("id")], "tags": [tid], "applyTags": "add"})),
         );
         println!("  carried tag {} over", lbl);
+    }
+    // The website request follows the film; Radarr is already handled here.
+    for r in &seerr_reqs {
+        crate::integrations::rebind_request(r, pick.i("tmdbId"), true, false);
     }
 }
 
@@ -2004,4 +2126,479 @@ fn watch_check(
         }
     }
     Ok((code, lines.join("\n")))
+}
+
+// --- adopt: movie folders Radarr doesn't own -----------------------------------
+//
+// The library predates Radarr (set up May 2026): on 2026-09-04, 104 of 713
+// movie folders — Iron Man 2/3, Dune, Kill Bill, Knives Out, five Spider-Men —
+// had no Radarr entry. Seerr didn't mind (it reads Jellyfin), but the
+// direct-to-Hermes path did: `add` saw "not in radarr", added, and the post-add
+// search grabbed a 63GB remux "upgrade" over a film that was watchable all
+// along. `adopt` takes such a folder in as-is: unmonitored, no search.
+
+/// Letters+digits only, lowercased. Radarr's folder naming swaps ':' for
+/// ' - ' and drops illegal characters, so "John Wick: Chapter 4" and the
+/// folder "John Wick - Chapter 4" must compare equal.
+fn title_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// "Title (Year)" folder name → (title, year); year 0 when absent.
+fn parse_movie_folder(name: &str) -> (String, i64) {
+    let t = name.trim();
+    if t.ends_with(')') {
+        if let Some(open) = t.rfind(" (") {
+            let y = &t[open + 2..t.len() - 1];
+            if y.len() == 4 && y.chars().all(|c| c.is_ascii_digit()) {
+                return (t[..open].trim().to_string(), y.parse().unwrap_or(0));
+            }
+        }
+    }
+    (t.to_string(), 0)
+}
+
+fn norm_path(p: &str) -> String {
+    p.trim_end_matches('/').to_string()
+}
+
+fn basename(p: &str) -> String {
+    std::path::Path::new(p)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.to_string())
+}
+
+fn dir_video_bytes(dir: &str) -> i64 {
+    let mut total = 0i64;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let ext = p
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if matches!(ext.as_str(), "mkv" | "mp4" | "avi" | "m4v" | "ts" | "webm" | "mov" | "wmv") {
+                if let Ok(md) = e.metadata() {
+                    total += md.len() as i64;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Folders with video under Radarr's root folder(s) that no Radarr entry
+/// owns, sorted. `movies` is the GET /movie list (callers usually have it).
+pub fn unmanaged_movie_dirs(movies: &[Value]) -> Vec<String> {
+    let owned: std::collections::HashSet<String> =
+        movies.iter().map(|m| norm_path(m.s("path"))).collect();
+    let rresp = api("radarr", "GET", "/rootfolder", None);
+    let mut out = vec![];
+    for r in items(&rresp) {
+        let Ok(rd) = std::fs::read_dir(r.s("path")) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let ps = p.to_string_lossy().to_string();
+            if owned.contains(&norm_path(&ps)) || dir_video_bytes(&ps) == 0 {
+                continue;
+            }
+            out.push(ps);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The unmanaged folder that IS this TMDB pick: Jellyfin's item with the same
+/// tmdb id (its Path names the folder), else a folder named "Title (Year)".
+fn unmanaged_folder_for(pick: &Value, movies: &[Value]) -> Option<String> {
+    let dirs = unmanaged_movie_dirs(movies);
+    if dirs.is_empty() {
+        return None;
+    }
+    let tmdb = pick.i("tmdbId").to_string();
+    for it in crate::integrations::jf_search_items(pick.s("title"), 10) {
+        if it.s("Type") != "Movie" {
+            continue;
+        }
+        if it.at(&["ProviderIds"]).get("Tmdb").and_then(Value::as_str) != Some(tmdb.as_str()) {
+            continue;
+        }
+        let parent = std::path::Path::new(it.s("Path"))
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(d) = dirs.iter().find(|d| norm_path(d) == norm_path(&parent)) {
+            return Some(d.clone());
+        }
+    }
+    let key = title_key(pick.s("title"));
+    let year = pick.i("year");
+    dirs.into_iter().find(|d| {
+        let (t, y) = parse_movie_folder(&basename(d));
+        title_key(&t) == key && (y == year || y == 0)
+    })
+}
+
+/// For `arr where`: a Jellyfin movie matching the query whose folder no
+/// Radarr entry owns → (name, year, dir).
+pub fn unmanaged_jf_movie(q: &str) -> Option<(String, String, String)> {
+    let jf: Vec<Value> = crate::integrations::jf_search_items(q, 5)
+        .into_iter()
+        .filter(|it| it.s("Type") == "Movie")
+        .collect();
+    if jf.is_empty() {
+        return None;
+    }
+    let mresp = api("radarr", "GET", "/movie", None);
+    let dirs = unmanaged_movie_dirs(items(&mresp));
+    for it in &jf {
+        let parent = std::path::Path::new(it.s("Path"))
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if let Some(d) = dirs.iter().find(|d| norm_path(d) == norm_path(&parent)) {
+            let year = it
+                .get("ProductionYear")
+                .and_then(Value::as_i64)
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            return Some((it.s("Name").to_string(), year, d.clone()));
+        }
+    }
+    None
+}
+
+pub struct AdoptPlan {
+    pub dir: String,
+    pub bytes: i64,
+    pub pick: Option<Value>,
+    pub cands: Vec<Value>,
+}
+
+/// Match a folder to TMDB: `--tmdb` wins; else exact title (folder-normalised)
+/// + the folder's year, tolerating a one-year TMDB/release-date skew only when
+/// nothing matches the year exactly.
+fn resolve_folder(dir: &str, tmdb: i64) -> AdoptPlan {
+    let (title, year) = parse_movie_folder(&basename(dir));
+    let bytes = dir_video_bytes(dir);
+    // Jellyfin has already identified this folder; its tmdb id beats a fresh
+    // title lookup (three "Aladdin (1992)" entries on TMDB, one real film).
+    let from_jf = tmdb == 0;
+    let tmdb = if tmdb != 0 { tmdb } else { jf_tmdb_for_dir(&title, dir) };
+    let mut cands: Vec<Value> = if tmdb != 0 {
+        match try_api("radarr", "GET", &format!("/movie/lookup/tmdb?tmdbId={}", tmdb), None, 60) {
+            // Jellyfin's id is only trusted when the folder agrees on title or
+            // year: "The King (2019)" was scanned in as The Lion King (1994).
+            Ok(Some(v)) if v.is_object() && from_jf => {
+                let key = title_key(&title);
+                if title_key(v.s("title")) == key
+                    || title_key(v.s("originalTitle")) == key
+                    || (year != 0 && (v.i("year") - year).abs() <= 1)
+                {
+                    vec![v]
+                } else {
+                    println!(
+                        "  ⚠ {}: Jellyfin identifies it as {} ({}) tmdb={} — folder disagrees, so its Jellyfin match is probably wrong (fix that in Jellyfin: Edit metadata → Identify)",
+                        basename(dir),
+                        v.s("title"),
+                        py_get(&v, "year"),
+                        v.i("tmdbId")
+                    );
+                    vec![]
+                }
+            }
+            Ok(Some(v)) if v.is_object() => vec![v],
+            _ => vec![],
+        }
+    } else {
+        let res = try_api(
+            "radarr",
+            "GET",
+            &format!("/movie/lookup?term={}", py_quote(&title)),
+            None,
+            60,
+        )
+        .ok()
+        .flatten();
+        let all: Vec<Value> = res.map(|r| items(&Some(r)).to_vec()).unwrap_or_default();
+        let key = title_key(&title);
+        let exact: Vec<Value> = all
+            .iter()
+            .filter(|c| title_key(c.s("title")) == key || title_key(c.s("originalTitle")) == key)
+            .cloned()
+            .collect();
+        if year == 0 {
+            exact
+        } else {
+            let same: Vec<Value> = exact.iter().filter(|c| c.i("year") == year).cloned().collect();
+            if !same.is_empty() {
+                same
+            } else {
+                exact.into_iter().filter(|c| (c.i("year") - year).abs() <= 1).collect()
+            }
+        }
+    };
+    cands.truncate(8);
+    let pick = if cands.len() == 1 { Some(cands[0].clone()) } else { None };
+    AdoptPlan { dir: dir.to_string(), bytes, pick, cands }
+}
+
+/// POST the movie with its existing folder as `path`: Radarr scans it and
+/// assigns the file — no search, unmonitored unless asked. Prints one line.
+fn adopt_one(plan: &AdoptPlan, pick: &Value, monitored: bool, pid: i64, root: &str) -> Option<Value> {
+    let body = json!({
+        "title": pick.get("title").cloned().unwrap_or(Value::Null),
+        "titleSlug": pick.get("titleSlug").cloned().unwrap_or(Value::Null),
+        "images": match pick.get("images") { Some(v) if truthy(v) => v.clone(), _ => json!([]) },
+        "year": pick.get("year").cloned().unwrap_or(Value::Null),
+        "tmdbId": pick.get("tmdbId").cloned().unwrap_or(Value::Null),
+        "qualityProfileId": pid,
+        "rootFolderPath": root,
+        "path": plan.dir,
+        "monitored": monitored,
+        "minimumAvailability": "released",
+        "addOptions": {"searchForMovie": false, "monitor": if monitored { "movieOnly" } else { "none" }},
+    });
+    let created = match try_api("radarr", "POST", "/movie", Some(&body), 120) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            println!("  ✗ {} — radarr returned nothing", basename(&plan.dir));
+            return None;
+        }
+        Err(e) => {
+            println!("  ✗ {} — {}", basename(&plan.dir), crate::integrations::seerr_err(e));
+            return None;
+        }
+    };
+    let id = created.i("id");
+    // Radarr's post-add disk scan is quick but asynchronous.
+    let mut got: Option<Value> = None;
+    for _ in 0..15 {
+        std::thread::sleep(Duration::from_secs(1));
+        if let Ok(Some(m)) = try_api("radarr", "GET", &format!("/movie/{}", id), None, 60) {
+            if m.b("hasFile") {
+                got = Some(m);
+                break;
+            }
+        }
+    }
+    let file_note = match &got {
+        Some(m) => format!("file assigned ({}GB)", fmt_gb(m.i("sizeOnDisk"))),
+        None => format!(
+            "⚠ no file assigned yet ({}GB on disk; radarr's scan is pending — `arr radarr status {}` later)",
+            fmt_gb(plan.bytes),
+            id
+        ),
+    };
+    println!(
+        "adopted [{}] {} ({}) tmdb={} — {}, {}",
+        id,
+        created.s("title"),
+        py_get(&created, "year"),
+        created.i("tmdbId"),
+        file_note,
+        if monitored { "monitored" } else { "unmonitored, no search" }
+    );
+    if let Some(w) = jf_watch_line(&plan.dir) {
+        println!("{}", w);
+    }
+    Some(got.unwrap_or(created))
+}
+
+fn print_plan(plan: &AdoptPlan) {
+    let folder = basename(&plan.dir);
+    match &plan.pick {
+        Some(p) => println!(
+            "  {}  →  {} ({}) tmdb={}  {}GB",
+            folder,
+            p.s("title"),
+            py_get(p, "year"),
+            p.i("tmdbId"),
+            fmt_gb(plan.bytes)
+        ),
+        None if plan.cands.is_empty() => {
+            let (t, _) = parse_movie_folder(&folder);
+            println!(
+                "  {}  →  ? no exact TMDB match — `arr radarr lookup '{}'` then `arr radarr adopt '{}' --tmdb <id> --yes`",
+                folder, t, folder
+            );
+        }
+        None => {
+            let opts: Vec<String> = plan
+                .cands
+                .iter()
+                .map(|c| format!("{} ({}) tmdb={}", c.s("title"), py_get(c, "year"), c.i("tmdbId")))
+                .collect();
+            println!(
+                "  {}  →  ? ambiguous: {} — `arr radarr adopt '{}' --tmdb <id> --yes`",
+                folder,
+                opts.join("; "),
+                folder
+            );
+        }
+    }
+}
+
+/// arr radarr adopt [<folder substring>|--all] [--tmdb ID] [--monitored] [--yes]
+pub fn cmd_adopt(svc: &str, args: &[String]) {
+    if svc != "radarr" {
+        die("adopt: radarr only");
+    }
+    let (flags, rest) = pop_flags(
+        args,
+        &[("--all", 0), ("--tmdb", 1), ("--monitored", 0), ("--yes", 0), ("--dry-run", 0)],
+    );
+    let tmdb = flags.val("--tmdb").map(|v| parse_int_flag(v, "--tmdb")).unwrap_or(0);
+    let mresp = api("radarr", "GET", "/movie", None);
+    let dirs = unmanaged_movie_dirs(items(&mresp));
+    let roots: Vec<String> = items(&api("radarr", "GET", "/rootfolder", None))
+        .iter()
+        .map(|r| r.s("path").to_string())
+        .collect();
+    if dirs.is_empty() {
+        println!("no unmanaged movie folders under {} — radarr owns every folder with video", roots.join(", "));
+        return;
+    }
+    if !flags.has("--all") && rest.is_empty() {
+        println!("unmanaged movie folders under {}: {}", roots.join(", "), dirs.len());
+        for d in &dirs {
+            println!("  {}  {}GB", basename(d), fmt_gb(dir_video_bytes(d)));
+        }
+        println!("next       arr radarr adopt --all   (dry run: matches each to TMDB) | arr radarr adopt '<folder>' --yes");
+        return;
+    }
+    let sel: Vec<String> = if flags.has("--all") {
+        dirs.clone()
+    } else {
+        let ql = rest.join(" ").to_lowercase();
+        dirs.iter().filter(|d| basename(d).to_lowercase().contains(&ql)).cloned().collect()
+    };
+    if sel.is_empty() {
+        die(&format!(
+            "adopt: no unmanaged folder matches '{}' (bare `arr radarr adopt` lists them)",
+            rest.join(" ")
+        ));
+    }
+    if tmdb != 0 && sel.len() != 1 {
+        die(&format!("adopt: --tmdb applies to exactly one folder ({} matched)", sel.len()));
+    }
+    let go = flags.has("--yes") && !flags.has("--dry-run");
+    println!(
+        "unmanaged movie folders: {} ({} selected) — matching to TMDB",
+        dirs.len(),
+        sel.len()
+    );
+    let plans: Vec<AdoptPlan> = sel
+        .iter()
+        .map(|d| {
+            let p = resolve_folder(d, tmdb);
+            print_plan(&p);
+            p
+        })
+        .collect();
+    let ok: Vec<&AdoptPlan> = plans.iter().filter(|p| p.pick.is_some()).collect();
+    let unresolved = plans.len() - ok.len();
+    let mode = if flags.has("--monitored") { "monitored" } else { "unmonitored" };
+    if !go {
+        println!(
+            "would adopt {} ({}, no search){} — rerun with --yes",
+            ok.len(),
+            mode,
+            if unresolved > 0 {
+                format!("; {} need a --tmdb pick", unresolved)
+            } else {
+                String::new()
+            }
+        );
+        return;
+    }
+    if ok.is_empty() {
+        die("adopt: nothing resolvable to adopt");
+    }
+    let (pid, pname, root) = profile_and_root(svc, None, None);
+    println!("adopting {} into radarr (profile={} root={})", ok.len(), pname, root);
+    let mut done = 0;
+    for p in &ok {
+        if adopt_one(p, p.pick.as_ref().unwrap(), flags.has("--monitored"), pid, &root).is_some() {
+            done += 1;
+        }
+    }
+    println!(
+        "adopted {} of {}{}",
+        done,
+        ok.len(),
+        if unresolved > 0 {
+            format!("; {} still need a --tmdb pick (listed above)", unresolved)
+        } else {
+            String::new()
+        }
+    );
+}
+
+/// Every Jellyfin movie keyed by its folder: (name, year, tmdb). One call —
+/// searching by folder title misses items Jellyfin named differently
+/// ("The Little Soldier (1963)" is served as "Le Petit Soldat").
+fn jf_movie_dirs() -> &'static HashMap<String, (String, String, i64, String)> {
+    static MAP: std::sync::OnceLock<HashMap<String, (String, String, i64, String)>> = std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut m = HashMap::new();
+        let r = jf_api(
+            "/Items",
+            &[
+                ("Recursive", "true"),
+                ("IncludeItemTypes", "Movie"),
+                ("Fields", "Path,ProviderIds"),
+            ],
+            120,
+            "GET",
+            true,
+        );
+        for it in r.map(|v| v.a("Items").to_vec()).unwrap_or_default() {
+            let parent = std::path::Path::new(it.s("Path"))
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if parent.is_empty() {
+                continue;
+            }
+            let year = it
+                .get("ProductionYear")
+                .and_then(Value::as_i64)
+                .map(|y| y.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let tmdb = it
+                .at(&["ProviderIds"])
+                .get("Tmdb")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            m.insert(norm_path(&parent), (it.s("Name").to_string(), year, tmdb, it.s("Id").to_string()));
+        }
+        m
+    })
+}
+
+/// The tmdb id Jellyfin attached to the movie it serves from `dir`, or 0.
+fn jf_tmdb_for_dir(_title: &str, dir: &str) -> i64 {
+    jf_movie_dirs().get(&norm_path(dir)).map(|x| x.2).unwrap_or(0)
+}
+
+/// "watch: <deep link>" for the movie Jellyfin serves from `dir`, if any —
+/// the agent hands the link to the requester so they can go straight to it.
+pub fn jf_watch_line(dir: &str) -> Option<String> {
+    jf_movie_dirs()
+        .get(&norm_path(dir))
+        .filter(|x| !x.3.is_empty())
+        .map(|x| format!("  watch: {}", arr_api::jf_item_url(&x.3)))
 }
