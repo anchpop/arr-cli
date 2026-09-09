@@ -2063,7 +2063,10 @@ fn find_last_num(cs: &[char]) -> Option<i64> {
 /// Parse an episode reference from a filename.
 /// Returns Se(season, ep) | Abs(n) | None.
 fn episode_number(name: &str) -> Option<EpRef> {
-    let mut base = name.to_string();
+    // Sonarr treats '_' as a space; the \b-emulating parsers below treat it as
+    // a word char, so underscore-separated names ("Excel_Saga_-_05_(...)") would
+    // otherwise never yield an episode number.
+    let mut base = name.replace('_', " ");
     for ext in [".mkv", ".mp4", ".avi", ".m4v"] {
         if base.to_lowercase().ends_with(ext) {
             base.truncate(base.len() - ext.len());
