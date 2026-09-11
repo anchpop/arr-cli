@@ -45,7 +45,7 @@ Audit Seerr requests where either the request status is not completed or the med
     --data-binary "$payload"
   ```
   Verify with `arr sonarr-anime status '<title>'` and `arr sonarr-anime queue '<title words>'`.
-- **Single missing episode with an accepted release:** `arr sonarr grab '<series>' --episode <episodeId>`, then watch SAB and history. If SAB fails, do not keep forcing blocklisted or wrong-language alternatives without user approval.
+- **Single missing episode with an accepted release:** `arr sonarr grab '<series>' --episode <episodeId> --no-requester` (Seerr already tracks the requester), then watch SAB and history. If SAB fails, do not keep forcing blocklisted or wrong-language alternatives without user approval.
 - **Radarr failed repair:** search Radarr releases and Prowlarr by English title, original title, year, IMDb/TMDb IDs, and romanizations. If no alternate releases exist, report that clearly.
 
 ## Pitfalls
