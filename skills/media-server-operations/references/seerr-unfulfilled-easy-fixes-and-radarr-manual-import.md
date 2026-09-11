@@ -23,7 +23,7 @@ Good candidates to act on without further user prompting:
 
 - A monitored season has only a few missing episodes, and `arr sonarr releases '<title>' --episode <id>` shows clean accepted releases. Grab them, wait for SAB, verify `seasons` and history.
 - A completed Sonarr queue item is clearly the exact intended episode but import-blocked by filename/scene numbering. Use explicit manual import payload or the `arr sonarr import` helper after a dry run.
-- A Radarr movie has clean accepted releases and is missing; run a normal `arr radarr grab '<title>'`, wait for download/import, then verify `arr radarr status`.
+- A Radarr movie has clean accepted releases and is missing; run a normal `arr radarr grab '<title>' --no-requester` (Seerr already knows the requester), wait for download/import, then verify `arr radarr status`.
 
 Avoid auto-fixing when:
 

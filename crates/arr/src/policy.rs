@@ -920,6 +920,7 @@ pub fn cmd_add(svc: &str, args: &[String]) {
             ("--root", 1),
             ("--no-search", 0),
             ("--requester", 1),
+            ("--no-requester", 0),
             ("--dry-run", 0),
             ("--require-subs", 1),
             ("--require-audio", 1),
@@ -929,13 +930,10 @@ pub fn cmd_add(svc: &str, args: &[String]) {
     if rest.is_empty() {
         die("add: need a title");
     }
-    // Reject a malformed --requester up front — dying after the add has
-    // already mutated the library is the half-done shape we never want.
-    if let Some(r) = flags.val("--requester") {
-        if r.trim().is_empty() || !r.trim().chars().all(|c| c.is_ascii_digit()) {
-            die(&format!("add: --requester must be a numeric Discord user id (got '{}')", r));
-        }
-    }
+    // Who is this for? Decided up front (a malformed or missing answer dies
+    // before the library is touched — no half-done adds), and it is REQUIRED:
+    // an add nobody claims is an add the download-notifier can't report on.
+    crate::browse::requester_choice("add", &flags, &[]);
     let term = rest.join(" ");
     let is_series = svc.starts_with("sonarr");
     let tvdb = flags.val("--tvdb").map(|v| parse_int_flag(v, "--tvdb")).unwrap_or(0);

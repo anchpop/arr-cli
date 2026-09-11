@@ -49,7 +49,7 @@ Only run without `--dry-run` if the single-file mapping points to the intended m
 
 ```sh
 arr sonarr raw DELETE '/queue/<queueId>?removeFromClient=false&blocklist=false'
-arr sonarr grab '<show>' --season <N>
+arr sonarr grab '<show>' --season <N> --no-requester
 arr sonarr wait <commandId> --timeout 300
 arr sab prio '<distinct show/season terms>' --top
 ```

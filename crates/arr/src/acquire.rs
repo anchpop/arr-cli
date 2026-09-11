@@ -731,6 +731,7 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             ("--wait", 0),
             ("--timeout", 1),
             ("--requester", 1),
+            ("--no-requester", 0),
             ("--no-wait", 0),
             ("--monitor", 0),
             ("--match", 1),
@@ -739,6 +740,15 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
     if rest.is_empty() {
         die("grab: need an id or query");
     }
+    // Who is this for? Required, like `add` — unless the item already carries
+    // a requester tag from an earlier add/grab (repairs and re-grabs on a
+    // tracked item need no repeat). Not-in-library falls through to the add
+    // handoff below, which enforces the same choice.
+    let already: Vec<String> = match crate::disk::resolve_soft(svc, &rest[0]) {
+        Ok(id) => crate::browse::item_requesters(svc, id),
+        Err(_) => Vec::new(),
+    };
+    crate::browse::requester_choice("grab", &flags, &already);
     let overridef = flags.has("--override");
     let dry = flags.has("--dry-run");
     // --match targets ONE specific release from the candidate list (the thing
@@ -822,7 +832,7 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
                     add_args.push("--requester".into());
                     add_args.push(v.to_string());
                 }
-                for f in ["--dry-run", "--no-wait"] {
+                for f in ["--dry-run", "--no-wait", "--no-requester"] {
                     if flags.has(f) {
                         add_args.push(f.into());
                     }

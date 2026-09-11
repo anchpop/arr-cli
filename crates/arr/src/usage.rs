@@ -30,8 +30,9 @@ Commands (sonarr & radarr unless noted):
         a single-match sonarr status also prints per-season coverage flags,
         so "do we have X?" surfaces partially-downloaded seasons by itself
   add <title> [--year Y] [--tvdb/--tmdb ID] [--seasons all|s1,s2|none]
-        [--quality NAME] [--root PATH] [--no-search] [--requester <discordId>]
-        [--require-subs L] [--require-audio L] [--no-wait] [--dry-run]
+        [--quality NAME] [--root PATH] [--no-search] [--require-subs L]
+        [--require-audio L] [--no-wait] [--dry-run]
+        (--requester <discordId> | --no-requester)      <- one of these is REQUIRED
         add by title. REFUSES ambiguous matches (lists candidates — narrow by
         --year/--tvdb/--tmdb; the wrong-Gloria guard). If already in the
         library, prints its per-season coverage instead of adding. Defaults:
@@ -40,8 +41,12 @@ Commands (sonarr & radarr unless noted):
         command answers "is it downloading?" (--no-wait skips the wait).
         Fresh grabs are promoted to the front of the download queue (an
         interactive add means someone is waiting; backlog churn can't starve it).
-        --requester wires up the download-notifier DM; --require-* makes the
-        notifier's ready DM verify subs/dub languages via ffprobe.
+        Say who it's for: --requester <discordId> wires up the download-notifier
+        DM (live progress bar -> ✅ ready ping); --no-requester says nobody is
+        waiting (your own add, a repair, a Seerr request the notifier already
+        tracks). Omitting both refuses — an unclaimed add is one the notifier
+        can't report on. --require-* makes the notifier's ready DM verify
+        subs/dub languages via ffprobe.
   coverage <id|query> [--fix] [--tracks] [--lang LANG] [--fix-subs] [--dry-run]  (sonarr)
   coverage --all [--fix] [--quiet] [--limit N]
         per-season gaps vs AIRED episodes. --fix searches missing MONITORED
@@ -111,6 +116,9 @@ Commands (sonarr & radarr unless noted):
         (--timeout SECS, def 300)
         --requester <discordId>: stamp a requester:<id> tag so the download-notifier
               DMs that person a live progress bar (use when grabbing for someone)
+        --no-requester: nobody is waiting on this grab. One of the two is
+              REQUIRED unless the item already carries a requester tag
+              (repairs/re-grabs on a tracked item pass through).
   subtitle-harvest <id|query> --subs LANG [--grab --match SUBSTR]
         [--fallback 'S1 || S2'] [--limit N] [--dry-run]              (radarr)
   subtitle-harvest --collect [--dry-run] | --adopt [--yes] | --status

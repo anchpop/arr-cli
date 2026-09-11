@@ -312,6 +312,63 @@ pub fn tag_requester(svc: &str, query: &str, discord_id: &str, remove: bool) -> 
     (coll.to_string(), item_id, did)
 }
 
+/// Discord ids from an item's `requester-<id>` tags — who the download-notifier
+/// will DM about it. Empty means nobody is wired up.
+pub fn item_requesters(svc: &str, item_id: i64) -> Vec<String> {
+    let coll = if svc.starts_with("sonarr") { "series" } else { "movie" };
+    let item = match try_api(svc, "GET", &format!("/{}/{}", coll, item_id), None, 60) {
+        Ok(Some(v)) => v,
+        _ => return Vec::new(),
+    };
+    let labels: HashMap<i64, String> = match try_api(svc, "GET", "/tag", None, 60) {
+        Ok(t @ Some(_)) => arr_api::json::items(&t)
+            .iter()
+            .map(|t| (t.i("id"), t.s("label").to_string()))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    item.a("tags")
+        .iter()
+        .filter_map(|id| labels.get(&id.as_i64().unwrap_or(0)))
+        .filter_map(|l| l.strip_prefix("requester-").map(str::to_string))
+        .collect()
+}
+
+/// `add`/`grab` start a download on someone's behalf, and the download-notifier
+/// can only DM a person it has been told about. So every such command states
+/// who it's for: `--requester <discordId>`, or an explicit `--no-requester`.
+/// A silent omission is the exact failure this guards against (2026-09-10: an
+/// untagged add left the requester polling "now?" by hand six times).
+/// Returns Some(id) for --requester, None for --no-requester; dies otherwise.
+/// `already` lets grab pass an item that carries a requester tag from earlier.
+pub fn requester_choice(cmd: &str, flags: &Flags, already: &[String]) -> Option<String> {
+    let req = flags.val("--requester").map(str::trim).filter(|v| !v.is_empty());
+    let none = flags.has("--no-requester");
+    match (req, none) {
+        (Some(_), true) => die(&format!("{}: --requester and --no-requester contradict each other — pick one", cmd)),
+        (Some(r), false) => {
+            if !r.chars().all(|c| c.is_ascii_digit()) {
+                die(&format!("{}: --requester must be a numeric Discord user id (got '{}')", cmd, r));
+            }
+            Some(r.to_string())
+        }
+        (None, true) => None,
+        (None, false) => {
+            if !already.is_empty() {
+                println!(
+                    "  requester already tagged: {} (download-notifier DMs them)",
+                    already.join(", ")
+                );
+                return None;
+            }
+            die(&format!(
+                "{}: say who this is for — --requester <discordId> (the download-notifier DMs them a live progress bar + the ready ping) or --no-requester (nobody is waiting on it: a library repair, your own add, or a Seerr request the notifier already tracks)",
+                cmd
+            ))
+        }
+    }
+}
+
 /// ['require-subs-eng', ...] from --require-subs/--require-audio flags.
 /// The download-notifier reads these at ready-time and appends a verified
 /// '🔎 eng subs ✓' line to the ✅ embed — no watcher cron needed.
