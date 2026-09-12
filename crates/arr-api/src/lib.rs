@@ -11,10 +11,13 @@ pub mod http;
 pub mod json;
 pub mod util;
 
-pub use env::{bindery_key, env_key, get_key, jf_item_url, jf_key, jf_public_url, sab_key, seerr_key};
+pub use env::{
+    bindery_key, env_key, get_key, jf_item_url, jf_key, jf_public_url, sab_key, seerr_key,
+    wizarr_key, wizarr_public_url,
+};
 pub use http::{
     api, api_t, bazarr_api, bindery_api, jf_api, sab_api, seerr_api, shelfmark_api, try_api,
-    try_seerr, ApiError,
+    try_seerr, wizarr_api, ApiError,
 };
 pub use json::JsonExt;
 pub use util::{die, fmt_gb, gb, mb, parse_seasons, pop_flags, resolve_id, Flags};
@@ -42,3 +45,4 @@ pub const SEERR_PORT: u16 = 5055;
 pub const BAZARR_PORT: u16 = 6767;
 pub const BINDERY_PORT: u16 = 8787;
 pub const SHELFMARK_PORT: u16 = 8084;
+pub const WIZARR_PORT: u16 = 5690;

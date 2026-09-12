@@ -1,7 +1,7 @@
 //! arr — Sonarr/Radarr/Prowlarr/SABnzbd CLI (Rust port of arr.py).
 //!
 //! Dispatch mirrors arr.py's main(): `arr <svc> <cmd> ...` for the arr
-//! services, plus the sab/jellyfin/seerr/bazarr command families and the
+//! services, plus the sab/jellyfin/seerr/bazarr/wizarr/book command families and the
 //! top-level `arr delete` / `arr queue` conveniences. Output strings, flags
 //! and exit codes have parsers (Hermes' skills and cron watchdogs) — evolve
 //! them additively; grep `skills/` before rewording existing lines.
@@ -85,6 +85,17 @@ fn main() {
                 c => die(&format!("unknown bazarr command '{}'", c)),
             }
         }
+        "wizarr" => {
+            if rest.is_empty() {
+                die("wizarr: invite|invites");
+            }
+            let args = &rest[1..];
+            match rest[0].as_str() {
+                "invite" => integrations::wizarr_invite(args),
+                "invites" => integrations::wizarr_invites(args),
+                c => die(&format!("unknown wizarr command '{}'", c)),
+            }
+        }
         "book" => {
             if rest.is_empty() {
                 die("book: need a command (add, status)");
@@ -103,7 +114,7 @@ fn main() {
                     return locate::dispatch(svc, &rest);
                 }
                 die(&format!(
-                    "unknown service '{}' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr)",
+                    "unknown service '{}' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr|wizarr|book)",
                     svc
                 ));
             }

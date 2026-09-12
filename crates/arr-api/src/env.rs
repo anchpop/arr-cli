@@ -79,6 +79,21 @@ pub fn bindery_key() -> String {
     env_key("BINDERY_API_KEY", "ARR_API_KEY_BINDERY")
 }
 
+pub fn wizarr_key() -> String {
+    env_key("WIZARR_API_KEY", "ARR_API_KEY_WIZARR")
+}
+
+/// Public Wizarr URL — join links are `<this>/j/<CODE>`. Override with
+/// WIZARR_PUBLIC_URL.
+pub fn wizarr_public_url() -> String {
+    std::env::var("WIZARR_PUBLIC_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://join.beef.baby".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
 /// Public Jellyfin URL for deep links (the Caddy vhost). Override with
 /// JELLYFIN_PUBLIC_URL.
 pub fn jf_public_url() -> String {

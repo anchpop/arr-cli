@@ -243,6 +243,29 @@ pub fn shelfmark_api(
     }
 }
 
+/// Wizarr (invitation manager, X-API-Key, /api). Hard errors carry the
+/// response body: a 400 lists the available servers / the missing field.
+pub fn wizarr_api(
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout: u64,
+    soft: bool,
+) -> Option<Value> {
+    let url = format!("http://127.0.0.1:{}/api{}", crate::WIZARR_PORT, path);
+    let req = agent().request(method, &url).set("X-API-Key", &crate::env::wizarr_key());
+    match run(req, body, timeout) {
+        Ok(v) => v,
+        Err(_) if soft => None,
+        Err(ApiError::Http { code, detail }) => {
+            let d: String = detail.chars().take(300).collect();
+            die(&format!("wizarr {} {} -> HTTP {} {}", method, path, code, d))
+        }
+        Err(ApiError::Timeout) => die(&format!("wizarr {} {} -> timed out", method, path)),
+        Err(ApiError::Net(reason)) => die(&format!("wizarr {} {} -> {}", method, path, reason)),
+    }
+}
+
 /// qBittorrent WebUI (localhost auth bypass): form-encoded POST.
 pub fn qbit_post_form(path: &str, form: &[(&str, &str)]) -> Result<String, ApiError> {
     let url = format!("http://localhost:{}{}", crate::QBIT_PORT, path);

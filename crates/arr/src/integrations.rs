@@ -1,4 +1,4 @@
-//! Seerr / Jellyfin / Bazarr command families (port of arr.py lines 3077-3353).
+//! Seerr / Jellyfin / Bazarr / Wizarr command families (port of arr.py lines 3077-3353).
 //!
 //! Output strings have parsers — Hermes' skills and Andre's muscle memory;
 //! evolve additively. Python renders absent fields as "None" via `%s`; the
@@ -12,7 +12,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use arr_api::json::items;
-use arr_api::{api, bazarr_api, die, fmt_gb, jf_api, pop_flags, resolve_id, seerr_api, try_seerr, ApiError, JsonExt};
+use arr_api::{
+    api, bazarr_api, die, fmt_gb, jf_api, pop_flags, resolve_id, seerr_api, try_seerr, wizarr_api,
+    ApiError, JsonExt,
+};
 
 // --- Python-compat rendering helpers -----------------------------------------
 
@@ -1080,5 +1083,134 @@ pub fn bazarr_raw(args: &[String]) {
     match out {
         Some(v) => println!("{}", py_dumps(&v, 0)),
         None => println!("(empty response)"),
+    }
+}
+
+// --- Wizarr (invitations) ----------------------------------------------------
+
+/// arr wizarr invite [--expires day|week|month|never] [--multi-use]
+///
+/// Mint a join link. The link is what the invitee needs: opening it creates
+/// their Jellyfin account (they pick the username + password) and walks them
+/// through the onboarding pages. Defaults match how the links have always been
+/// made by hand in the admin UI: single-use, no account expiry; the link
+/// itself lapses after a week so a leaked one goes stale on its own.
+pub fn wizarr_invite(args: &[String]) {
+    let (flags, rest) = pop_flags(args, &[("--expires", 1), ("--multi-use", 0)]);
+    if !rest.is_empty() {
+        die("wizarr invite: usage: arr wizarr invite [--expires day|week|month|never] [--multi-use]");
+    }
+    let (expires_days, expires_label) = match flags.val_or("--expires", "week") {
+        "day" => (Some(1), "1 day"),
+        "week" => (Some(7), "7 days"),
+        "month" => (Some(30), "30 days"),
+        "never" => (None, "never"),
+        other => die(&format!(
+            "wizarr invite: --expires {} — want day|week|month|never",
+            other
+        )),
+    };
+    let multi = flags.has("--multi-use");
+
+    // Every verified server (in practice: the one Jellyfin). Wizarr refuses an
+    // invite with no server and lists what's available; we pick for the caller.
+    let servers = wizarr_api("GET", "/servers", None, 60, false).unwrap_or(Value::Null);
+    let server_ids: Vec<i64> = servers.at(&["servers"]).as_array().map(Vec::as_slice).unwrap_or(&[])
+        .iter()
+        .filter(|s| s.at(&["verified"]).as_bool().unwrap_or(false))
+        .filter_map(|s| s.at(&["id"]).as_i64())
+        .collect();
+    if server_ids.is_empty() {
+        die("wizarr invite: no verified media server in Wizarr — finish its setup at http://localhost:5690 first");
+    }
+
+    // Schema-validated payload: expires_in_days is an enum (omit it for
+    // "never") and duration must be a string — "" is what stores as "no
+    // account expiry" (the default "unlimited" would be a warning-per-login
+    // int() failure in Wizarr's expiry code).
+    let mut body = json!({
+        "server_ids": server_ids,
+        "unlimited": multi,
+        "duration": "",
+    });
+    if let Some(d) = expires_days {
+        body["expires_in_days"] = json!(d);
+    }
+    let resp = wizarr_api("POST", "/invitations", Some(&body), 60, false).unwrap_or(Value::Null);
+    let inv = resp.at(&["invitation"]);
+    let code = inv.at(&["code"]).as_str().unwrap_or("").to_string();
+    if code.is_empty() {
+        die(&format!("wizarr invite: no code in response: {}", resp));
+    }
+    let expires = match inv.at(&["expires"]).as_str() {
+        Some(ts) => format!("link expires {} ({})", &ts[..ts.len().min(10)], expires_label),
+        None => "link never expires".to_string(),
+    };
+    println!("invite: {}/j/{}", arr_api::wizarr_public_url(), code);
+    println!(
+        "  {} · {} · account access: no expiry",
+        if multi { "multi-use" } else { "single-use" },
+        expires
+    );
+    println!("  send them the link: opening it creates their Jellyfin account (they pick the username + password) and shows the how-to-watch pages. Nothing else to set up.");
+}
+
+/// arr wizarr invites — every invitation with its status, newest first.
+pub fn wizarr_invites(args: &[String]) {
+    if !args.is_empty() {
+        die("wizarr invites: takes no arguments");
+    }
+    let resp = wizarr_api("GET", "/invitations", None, 60, false).unwrap_or(Value::Null);
+    let mut invs: Vec<Value> = resp.at(&["invitations"]).as_array().cloned().unwrap_or_default();
+    invs.sort_by_key(|i| std::cmp::Reverse(i.at(&["id"]).as_i64().unwrap_or(0)));
+    if invs.is_empty() {
+        println!("no invitations");
+        return;
+    }
+    let base = arr_api::wizarr_public_url();
+    // `used_by` is rendered from the User relationship as "<User 18>" — map
+    // ids to usernames so the list says who actually joined.
+    let users = wizarr_api("GET", "/users", None, 60, true).unwrap_or(Value::Null);
+    let names: HashMap<i64, String> = users
+        .at(&["users"])
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|u| {
+            Some((u.at(&["id"]).as_i64()?, u.at(&["username"]).as_str()?.to_string()))
+        })
+        .collect();
+    for i in &invs {
+        let code = i.at(&["code"]).as_str().unwrap_or("?");
+        let status = i.at(&["status"]).as_str().unwrap_or("?");
+        let created = i.at(&["created"]).as_str().map(|s| &s[..s.len().min(10)]).unwrap_or("?");
+        let mut notes = Vec::new();
+        if i.at(&["unlimited"]).as_bool().unwrap_or(false) {
+            notes.push("multi-use".to_string());
+        }
+        if let Some(e) = i.at(&["expires"]).as_str() {
+            notes.push(format!("expires {}", &e[..e.len().min(10)]));
+        }
+        if let Some(u) = i.at(&["used_by"]).as_str().filter(|s| !s.is_empty()) {
+            let who = u
+                .strip_prefix("<User ")
+                .and_then(|r| r.strip_suffix('>'))
+                .and_then(|id| id.parse::<i64>().ok())
+                .and_then(|id| names.get(&id).cloned())
+                .unwrap_or_else(|| u.to_string());
+            notes.push(format!("used by {}", who));
+        } else if let Some(u) = i.at(&["used_at"]).as_str() {
+            notes.push(format!("used {}", &u[..u.len().min(10)]));
+        }
+        println!(
+            "{:>4}  {:<8} {}/j/{}  created {}{}",
+            i.at(&["id"]).as_i64().unwrap_or(0),
+            status,
+            base,
+            code,
+            created,
+            if notes.is_empty() { String::new() } else { format!("  ({})", notes.join(", ")) }
+        );
     }
 }
