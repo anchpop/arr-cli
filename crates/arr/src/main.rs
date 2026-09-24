@@ -16,6 +16,7 @@ mod harvest;
 mod integrations;
 mod locate;
 mod policy;
+mod reboot;
 mod usage;
 
 fn main() {
@@ -103,6 +104,7 @@ fn main() {
             book::dispatch(rest[0].as_str(), &rest[1..]);
         }
         "delete" => disk::cmd_delete_auto(&rest),
+        "reboot" => reboot::cmd_reboot(&rest),
         "queue" => acquire::cmd_queue_overview(&rest),
         "where" => locate::cmd_where(&rest),
         _ => {

@@ -25,6 +25,14 @@ sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
         forward. Start here for "is it downloading?" / "why isn't X there?"
         instead of checking each service.
 
+  arr reboot [--force | --when-free | --cancel]
+        checks Jellyfin viewers (including paused playback); plain reboot refuses
+        if anyone is watching or Jellyfin doesn't answer. --force reboots anyway.
+        --when-free reboots now if free, otherwise waits in a background service
+        until Jellyfin reports no streams. --cancel stops that pending wait.
+        progress: systemctl status hermes-reboot-when-free
+        Use only one mode flag. --wait is internal (the service's polling loop).
+
 Commands (sonarr & radarr unless noted):
   status [query]                  list items (optionally filter by title)
         a single-match sonarr status also prints per-season coverage flags,
