@@ -362,12 +362,7 @@ pub fn sab_cleanup(args: &[String]) {
     }
     let mut n = 0;
     for s in &hits {
-        let r = sab_api(
-            "history",
-            &[("name", "delete"), ("value", s.s("nzo_id")), ("del_files", "1")],
-            120,
-        );
-        if r.is_object() && truthy(r.at(&["status"])) {
+        if arr_api::sab_delete_job(s) {
             n += 1;
         }
     }

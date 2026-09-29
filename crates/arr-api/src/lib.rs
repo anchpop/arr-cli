@@ -16,8 +16,8 @@ pub use env::{
     wizarr_key, wizarr_public_url,
 };
 pub use http::{
-    api, api_t, bazarr_api, bindery_api, jf_api, sab_api, seerr_api, shelfmark_api, try_api,
-    try_seerr, wizarr_api, ApiError,
+    api, api_t, bazarr_api, bindery_api, jf_api, sab_api, sab_delete_job, seerr_api, shelfmark_api,
+    try_api, try_seerr, wizarr_api, ApiError,
 };
 pub use json::JsonExt;
 pub use util::{die, fmt_gb, gb, mb, parse_seasons, pop_flags, resolve_id, Flags};

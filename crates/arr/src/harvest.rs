@@ -25,7 +25,7 @@ use std::process::{Command, Stdio};
 use serde_json::{json, Value};
 
 use arr_api::json::items;
-use arr_api::{api, api_t, die, mb, pop_flags, resolve_id, sab_api, JsonExt};
+use arr_api::{api, api_t, die, mb, pop_flags, resolve_id, sab_api, sab_delete_job, JsonExt};
 
 use crate::policy::{file_tracks, norm_lang};
 
@@ -549,7 +549,6 @@ fn collect(dry: bool) {
     let mut harvested_any = false;
     for s in &slots {
         let name = s.s("name");
-        let nzo = s.s("nzo_id").to_string();
         let (mid, name_lang) = parse_job_name(name);
         match s.s("status") {
             "Completed" => {}
@@ -559,7 +558,7 @@ fn collect(dry: bool) {
                     if mid > 0 {
                         record_outcome(mid, &name_lang, name, "download-failed");
                     }
-                    sab_delete_history(&nzo);
+                    sab_delete_job(s);
                 }
                 // a dead release advances the chain just like an empty payload
                 if mid > 0 {
@@ -589,7 +588,7 @@ fn collect(dry: bool) {
                 || outcome.starts_with("no-")
                 || outcome == "already-satisfied";
             if probed {
-                sab_delete_history(&nzo); // del_files=1 — the payload video is never kept
+                sab_delete_job(s); // the payload video is never kept
                 println!("  payload deleted (SAB history + files)");
             } else {
                 println!("  payload KEPT (outcome: {}) — will retry next --collect", outcome);
@@ -1041,14 +1040,6 @@ fn payload_scan(dir: &str) -> (Vec<String>, Vec<String>) {
     videos.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)));
     subs.sort();
     (videos, subs)
-}
-
-fn sab_delete_history(nzo: &str) {
-    sab_api(
-        "history",
-        &[("name", "delete"), ("value", nzo), ("del_files", "1")],
-        120,
-    );
 }
 
 // --- adopt: take over Radarr-queued language-replacement downloads ------------

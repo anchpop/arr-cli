@@ -153,6 +153,39 @@ pub fn sab_api(mode: &str, params: &[(&str, &str)], timeout: u64) -> Value {
     }
 }
 
+/// Remove a SAB history slot AND its payload. SAB's own `del_files=1` only
+/// deletes a finished job's incomplete/admin dir, never the completed payload
+/// (sabnzbd api.py `_api_history_delete`), so every "delete + files" caller
+/// silently leaked its download — 751G of subtitle-harvest payloads by
+/// 2026-09-28. `storage` is `<complete>/<category>/<job>` or a file inside it
+/// (or a bare file directly in the category dir); never climb above the job.
+pub fn sab_delete_job(slot: &Value) -> bool {
+    use crate::json::JsonExt;
+    use std::path::Path;
+    let r = sab_api(
+        "history",
+        &[("name", "delete"), ("value", slot.s("nzo_id")), ("del_files", "1")],
+        120,
+    );
+    let storage = Path::new(slot.s("storage"));
+    let job = if storage.is_file() { storage.parent() } else { Some(storage) };
+    let removed = match job {
+        Some(dir)
+            if dir.is_dir()
+                && dir.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str())
+                    == Some(slot.s("category")) =>
+        {
+            std::fs::remove_dir_all(dir)
+        }
+        _ if storage.is_file() => std::fs::remove_file(storage),
+        _ => Ok(()),
+    };
+    if let Err(e) = removed {
+        eprintln!("  ⚠ couldn't delete payload {}: {}", storage.display(), e);
+    }
+    r.is_object() && r.at(&["status"]).as_bool() == Some(true)
+}
+
 /// Jellyfin (X-Emby-Token). `soft` returns None on any error instead of dying.
 pub fn jf_api(
     path: &str,
