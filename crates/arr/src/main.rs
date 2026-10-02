@@ -8,6 +8,7 @@
 
 use arr_api::die;
 
+mod abook;
 mod acquire;
 mod book;
 mod browse;
@@ -97,6 +98,7 @@ fn main() {
                 c => die(&format!("unknown wizarr command '{}'", c)),
             }
         }
+        "abook" => abook::dispatch(&rest),
         "book" => {
             if rest.is_empty() {
                 die("book: need a command (add, status)");
@@ -116,7 +118,7 @@ fn main() {
                     return locate::dispatch(svc, &rest);
                 }
                 die(&format!(
-                    "unknown service '{}' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr|wizarr|book)",
+                    "unknown service '{}' (want sonarr|sonarr-anime|radarr|prowlarr|sab|jellyfin|seerr|bazarr|wizarr|book|abook)",
                     svc
                 ));
             }

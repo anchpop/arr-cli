@@ -4,7 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-ureq.workspace = true
+ureq = { workspace = true, features = ["cookies"] }
 serde_json.workspace = true
 form_urlencoded.workspace = true
 percent-encoding.workspace = true
+scraper = "0.27.0"
+cookie_store = { version = "0.21", features = ["serde_json"] }
+url = "2.5.8"

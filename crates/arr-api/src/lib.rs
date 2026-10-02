@@ -6,6 +6,7 @@
 //! survive transient errors) and a die-on-error wrapper matching arr.py's exact
 //! error strings (for the CLI).
 
+pub mod abook;
 pub mod env;
 pub mod http;
 pub mod json;

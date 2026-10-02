@@ -343,3 +343,47 @@ pub fn seerr_api(path: &str, params: &[(&str, &str)], timeout: u64, soft: bool) 
         Err(ApiError::Net(reason)) => die(&format!("seerr {} -> {}", path, reason)),
     }
 }
+
+/// Upload fetched NZB bytes, keeping SAB credentials/password out of the URL.
+pub fn sab_add_nzb(
+    nzb: &[u8],
+    category: &str,
+    name: &str,
+    password: Option<&str>,
+) -> Result<Value, String> {
+    use std::io::Write;
+    let boundary = "arr-abook-nzb-boundary";
+    let mut data = Vec::new();
+    let key = crate::sab_key();
+    for (k, v) in [
+        ("mode", "addfile"),
+        ("output", "json"),
+        ("apikey", key.as_str()),
+        ("cat", category),
+        ("nzbname", name),
+        ("password", password.unwrap_or("")),
+    ] {
+        write!(
+            data,
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+        )
+        .unwrap();
+    }
+    write!(data,"--{boundary}\r\nContent-Disposition: form-data; name=\"name\"; filename=\"audiobook.nzb\"\r\nContent-Type: application/x-nzb\r\n\r\n").unwrap();
+    data.extend_from_slice(nzb);
+    write!(data, "\r\n--{boundary}--\r\n").unwrap();
+    let r = agent()
+        .post(&format!("http://localhost:{}/api/", crate::SAB_PORT))
+        .timeout(Duration::from_secs(120))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
+        .send_bytes(&data)
+        .map_err(|_| "SAB NZB upload failed (network or HTTP error)".to_string())?;
+    let v: Value = r.into_json().map_err(|e| e.to_string())?;
+    if v["status"].as_bool() != Some(true) {
+        return Err(format!("SAB rejected NZB: {}", v["error"]));
+    }
+    Ok(v)
+}

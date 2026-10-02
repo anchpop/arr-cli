@@ -272,6 +272,17 @@ Books (Bindery usenet + Shelfmark/Anna's Archive; outside the arrs entirely):
         skip the download-notifier: DM the requester yourself when it lands.
   arr book status                       Shelfmark + Bindery queue rollup
 
+Audiobooks (abook.link forum → public NZB search → SAB; one step per command):
+  arr abook search '<query>'            list matching forum topics
+  arr abook reveal <topic-id|url>       Say Thanks on Andre's account; reveal subject/password
+  arr abook nzb '<search string>' [--site nzbindex|binsearch|nzbking]
+                                        list NZB candidates; inspect before grabbing
+  arr abook grab <nzb-url|provider:id> --name 'Author - Title' [--password P]
+                                        upload to SAB category audiobooks; print nzo_id
+        Follow with arr sab queue / history. No forum replies are posted.
+        ABOOK_USERNAME / ABOOK_PASSWORD come from environment or the env file.
+        Per-user cookies: $XDG_CACHE_HOME/arr/abook/ or ~/.cache/arr/abook/.
+
 Keys come from $ARR_API_KEY_<SVC> / $ARR_API_KEY_{SAB,JELLYFIN,SEERR,WIZARR} or the
 sops-rendered env file (%s). No sudo required."#;
 
