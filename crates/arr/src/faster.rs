@@ -10,6 +10,7 @@ const VERIFY_SECONDS: u64 = 150;
 const MIN_RECEIVED_MB: f64 = 100.0;
 const MAX_MISSING_FRACTION: f64 = 0.05;
 const MAX_TRIES: usize = 5;
+const SPEED_SAMPLE_SECONDS: u64 = 30;
 const JUNK_FORMAT_SCORE: i64 = -10_000;
 type Result<T> = std::result::Result<T, String>;
 
@@ -364,6 +365,25 @@ fn wait_moving(iid: i64, s: &Snapshot) -> Result<()> {
         "replacement did not receive {MIN_RECEIVED_MB} MB within {VERIFY_SECONDS}s"
     ))
 }
+/// (bytes left, bytes/s) of the replacement over SPEED_SAMPLE_SECONDS, while
+/// it has the connection to itself (the original is paused).
+fn measured_speed(iid: i64, s: &Snapshot) -> Result<(f64, f64)> {
+    let left = |r: &Value| -> Result<f64> {
+        let slot = slot(&sab(&[("limit", "1000")])?, r.s("downloadId"))
+            .map_err(|_| "SAB aborted it: articles missing on usenet".to_string())?;
+        Ok(number(&slot, "mbleft").ok_or("replacement byte count unavailable")? * 1048576.0)
+    };
+    let r = replacement(iid, s)?.ok_or("replacement left the Radarr queue")?;
+    let (start, t0) = (left(&r)?, Instant::now());
+    std::thread::sleep(Duration::from_secs(SPEED_SAMPLE_SECONDS));
+    let end = left(&r)?;
+    if end >= start {
+        return Err(format!(
+            "replacement stalled during the {SPEED_SAMPLE_SECONDS}s speed sample"
+        ));
+    }
+    Ok((end, (start - end) / t0.elapsed().as_secs_f64()))
+}
 fn remove_arr(r: &Value, client: bool, blocklist: bool) -> Result<()> {
     arr(
         "DELETE",
@@ -379,7 +399,7 @@ fn remove_arr(r: &Value, client: bool, blocklist: bool) -> Result<()> {
 fn swap(iid: i64, s: &Snapshot, release: &Value) -> std::result::Result<(), (bool, String)> {
     let id = s.slot.s("nzo_id");
     let old_priority = priority(&s.slot).map_err(|e| (false, e))?;
-    let (mut paused, mut submitted) = (false, false);
+    let (mut paused, mut submitted, mut bad) = (false, false, false);
     let prepared = (|| -> Result<()> {
         // Force downloads even while Paused; changing priority can unpause.
         set_priority(id, 0)?;
@@ -395,11 +415,26 @@ fn swap(iid: i64, s: &Snapshot, release: &Value) -> std::result::Result<(), (boo
             e => format!("submit: {e:?}"),
         })?;
         submitted = true;
-        wait_moving(iid, s)
+        bad = true;
+        wait_moving(iid, s)?;
+        // The ETA estimate assumed the original's speed; a post served mostly by
+        // the backup provider can be far slower. Measure before committing.
+        let speed = measured_speed(iid, s)?;
+        let (left, old_eta) = (speed.0, s.speed.map(|v| s.left / v));
+        if old_eta.is_some_and(|t| left / speed.1 + MIN_SAVING_SECONDS > t) {
+            bad = false; // it works, it's just slow here: no blocklist
+            return Err(format!(
+                "only {:.1} MB/s here (~{} vs ~{} for the original); not faster",
+                speed.1 / 1048576.0,
+                crate::browse::fmt_age((left / speed.1) as i64),
+                crate::browse::fmt_age(old_eta.unwrap() as i64)
+            ));
+        }
+        Ok(())
     })();
     if let Err(e) = prepared {
         let cleanup = replacement(iid, s).and_then(|r| match r {
-            Some(r) => remove_arr(&r, true, submitted),
+            Some(r) => remove_arr(&r, true, bad),
             None if !submitted => Ok(()),
             None => Err("replacement not visible in Radarr; check for a delayed grab".into()),
         });

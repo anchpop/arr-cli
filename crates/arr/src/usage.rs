@@ -20,7 +20,7 @@ sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
 
   arr radarr faster '<item>' [--dry-run | --yes]
         preview a safe smaller SAB release with --dry-run; --yes switches.
-        Cancels the old download only once the new one receives bytes.
+        Cancels the old one only once the new one downloads and is measurably faster.
         Never blocklists the old release; keeps the same movie and tags.
 
   arr where <title>               WHERE IS THIS? one call, whole pipeline:
