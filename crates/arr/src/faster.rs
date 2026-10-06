@@ -9,6 +9,7 @@ const MAX_REMAINING_FRACTION: f64 = 0.5;
 const VERIFY_SECONDS: u64 = 150;
 const MIN_RECEIVED_MB: f64 = 100.0;
 const MAX_MISSING_FRACTION: f64 = 0.05;
+const MAX_TRIES: usize = 5;
 const JUNK_FORMAT_SCORE: i64 = -10_000;
 type Result<T> = std::result::Result<T, String>;
 
@@ -195,8 +196,9 @@ fn acceptable(r: &Value, old: &Value, iid: i64) -> bool {
                         .any(|s| reason.contains(s)))
         })
 }
-fn select<'a>(releases: &'a [Value], s: &Snapshot, iid: i64) -> Option<&'a Value> {
-    releases
+/// Safe faster releases, best first by Radarr's own ranking (ReleaseWeight 0 = best).
+fn ranked<'a>(releases: &'a [Value], s: &Snapshot, iid: i64) -> Vec<&'a Value> {
+    let mut out: Vec<&Value> = releases
         .iter()
         .filter(|r| s.slow() && acceptable(r, &s.old, iid))
         .filter(|r| {
@@ -207,7 +209,12 @@ fn select<'a>(releases: &'a [Value], s: &Snapshot, iid: i64) -> Option<&'a Value
                 .is_none_or(|speed| (s.left - r.f("size")) / speed >= MIN_SAVING_SECONDS)
         })
         .filter(|r| r.get("releaseWeight").and_then(Value::as_i64).is_some())
-        .min_by_key(|r| r.i("releaseWeight")) // Radarr's full decision ordering, best = 0.
+        .collect();
+    out.sort_by_key(|r| r.i("releaseWeight"));
+    out
+}
+fn select<'a>(releases: &'a [Value], s: &Snapshot, iid: i64) -> Option<&'a Value> {
+    ranked(releases, s, iid).into_iter().next()
 }
 fn releases(iid: i64, timeout: u64) -> Result<Vec<Value>> {
     let v = try_api(
@@ -261,9 +268,15 @@ pub(crate) fn report(svc: &str, iid: i64, records: &[Value], acquisition: bool) 
     }
     match releases(iid, 30) {
         Ok(rels) => match select(&rels, &s, iid) {
-            Some(r) => choice(&s, r, iid),
+            Some(r) => {
+                choice(&s, r, iid);
+                println!(
+                    "  → tell the requester: full quality takes {}; a {}GB version would take {}. Offer it; if they want it, run the faster command above.",
+                    eta(s.left, s.speed), fmt_gb(r.i("size")), eta(r.f("size"), s.speed)
+                );
+            }
             None => println!(
-                "  no safe faster alternative; keeping current download (ETA {})",
+                "  → tell the requester the ETA ({}); no faster version exists",
                 eta(s.left, s.speed)
             ),
         },
@@ -323,7 +336,10 @@ fn wait_moving(iid: i64, s: &Snapshot) -> Result<()> {
     let (mut baseline, mut download_id) = (None, String::new());
     while start.elapsed().as_secs() < VERIFY_SECONDS {
         if let Some(r) = replacement(iid, s)? {
-            let slot = slot(&sab(&[("limit", "1000")])?, r.s("downloadId"))?;
+            // Gone from the queue within seconds = SAB aborted it as incomplete
+            // (DMCA'd/expired articles); a multi-GB release can't finish this fast.
+            let slot = slot(&sab(&[("limit", "1000")])?, r.s("downloadId"))
+                .map_err(|_| "SAB aborted it: articles missing on usenet".to_string())?;
             if matches!(slot.s("status"), "Paused" | "Failed") {
                 return Err("replacement paused or failed".into());
             }
@@ -348,43 +364,67 @@ fn wait_moving(iid: i64, s: &Snapshot) -> Result<()> {
         "replacement did not receive {MIN_RECEIVED_MB} MB within {VERIFY_SECONDS}s"
     ))
 }
-fn remove_arr(r: &Value, client: bool) -> Result<()> {
+fn remove_arr(r: &Value, client: bool, blocklist: bool) -> Result<()> {
     arr(
         "DELETE",
         &format!(
-            "/queue/{}?removeFromClient={client}&blocklist=false&skipRedownload=true",
+            "/queue/{}?removeFromClient={client}&blocklist={blocklist}&skipRedownload=true",
             r.i("id")
         ),
     )
     .map(|_| ())
 }
-fn swap(iid: i64, s: &Snapshot, release: &Value) -> Result<()> {
+/// `Err((true, _))`: this candidate didn't work out (indexer wouldn't serve it, or
+/// it was dead and is now blocklisted); the original is resumed, try the next.
+fn swap(iid: i64, s: &Snapshot, release: &Value) -> std::result::Result<(), (bool, String)> {
     let id = s.slot.s("nzo_id");
-    let old_priority = priority(&s.slot)?;
+    let old_priority = priority(&s.slot).map_err(|e| (false, e))?;
+    let (mut paused, mut submitted) = (false, false);
     let prepared = (|| -> Result<()> {
         // Force downloads even while Paused; changing priority can unpause.
         set_priority(id, 0)?;
         sab_action("pause", id)?;
-        crate::acquire::submit_release("radarr", release).map_err(|e| format!("submit: {e:?}"))?;
+        paused = true;
+        crate::acquire::submit_release("radarr", release).map_err(|e| match e {
+            arr_api::ApiError::Http { code, detail } => format!(
+                "indexer wouldn't serve it ({code}: {})",
+                serde_json::from_str::<Value>(&detail)
+                    .map(|v| v.s("message").to_string())
+                    .unwrap_or(detail)
+            ),
+            e => format!("submit: {e:?}"),
+        })?;
+        submitted = true;
         wait_moving(iid, s)
     })();
     if let Err(e) = prepared {
         let cleanup = replacement(iid, s).and_then(|r| match r {
-            Some(r) => remove_arr(&r, true),
+            Some(r) => remove_arr(&r, true, submitted),
+            None if !submitted => Ok(()),
             None => Err("replacement not visible in Radarr; check for a delayed grab".into()),
         });
         let resume = set_priority(id, old_priority).and_then(|_| sab_action("resume", id));
-        return Err(format!(
-            "{e}; replacement cleanup: {cleanup:?}; original resume: {resume:?}"
-        ));
+        return match (cleanup, resume) {
+            (Ok(()), Ok(())) => Err((paused, e)),
+            (cleanup, resume) => Err((
+                false,
+                format!("{e}; replacement cleanup: {cleanup:?}; original resume: {resume:?}"),
+            )),
+        };
     }
     // Ignore records downloadIgnored for the notifier; plain client removal
     // records no history. From here keep the verified replacement on errors.
-    remove_arr(&s.old, false).map_err(|e| {
-        format!("ignore old job uncertain: {e}; keep replacement, inspect old {id}")
+    remove_arr(&s.old, false, false).map_err(|e| {
+        (
+            false,
+            format!("ignore old job uncertain: {e}; keep replacement, inspect old {id}"),
+        )
     })?;
     sab_action("delete", id).map_err(|e| {
-        format!("replacement moving; old {id} ignored but deletion unconfirmed: {e}")
+        (
+            false,
+            format!("replacement moving; old {id} ignored but deletion unconfirmed: {e}"),
+        )
     })?;
     println!(
         "  switched to {}GB {} | ETA {}; original cancelled without blocklisting",
@@ -418,7 +458,8 @@ pub fn cmd_faster(svc: &str, args: &[String]) {
         if s.old.s("downloadId") != before.old.s("downloadId") {
             return Err("active job changed; nothing changed".into());
         }
-        let Some(r) = select(&rels, &s, iid) else {
+        let candidates = ranked(&rels, &s, iid);
+        let Some(best) = candidates.first() else {
             println!(
                 "no safe faster alternative; keeping current download (ETA {})",
                 eta(s.left, s.speed)
@@ -428,14 +469,33 @@ pub fn cmd_faster(svc: &str, args: &[String]) {
         println!(
             "  current ETA {}; choice: {}",
             eta(s.left, s.speed),
-            r.s("title")
+            best.s("title")
         );
-        choice(&s, r, iid);
-        if flags.has("--yes") {
-            swap(iid, &s, r)?;
-        } else {
+        choice(&s, best, iid);
+        if !flags.has("--yes") {
             println!("  dry-run: nothing changed; --yes confirms the switch");
+            return Ok(());
         }
+        // Popular titles often have DMCA'd releases: a dead one is blocklisted
+        // and the next-best is tried, the original resumed in between.
+        let mut tried = std::collections::HashSet::new();
+        let fresh = candidates
+            .iter()
+            .filter(|r| tried.insert(r.s("title").to_string()));
+        for r in fresh.take(MAX_TRIES) {
+            match swap(iid, &s, r) {
+                Ok(()) => return Ok(()),
+                Err((true, e)) => {
+                    println!("  ✗ {} — {e}; skipped, original resumed", r.s("title"))
+                }
+                Err((false, e)) => return Err(e),
+            }
+        }
+        println!(
+            "none of the {} faster releases tried would download (reasons above); kept the original (ETA {}). Hand-grabbing them won't go better",
+            tried.len(),
+            eta(s.left, s.speed)
+        );
         Ok(())
     })();
     if let Err(e) = result {
