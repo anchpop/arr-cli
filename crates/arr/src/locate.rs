@@ -482,6 +482,8 @@ pub fn cmd_where(args: &[String]) {
                     download_ids.push(did.to_lowercase());
                 }
             }
+            let owned: Vec<Value> = mine.iter().map(|r| (*r).clone()).collect();
+            crate::faster::report(h.svc, h.item.i("id"), &owned, false);
             next.push(format!(
                 "arr {} grab {}   (already downloading — this promotes it to the front of the queue)",
                 h.svc,

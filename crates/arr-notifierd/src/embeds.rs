@@ -45,6 +45,9 @@ const MAX_ATTEMPT_LINES: usize = 6;
 
 fn attempt_line(a: &Value, timeleft: &str, importing: bool, active: bool) -> String {
     let pct = a.i("pct");
+    if a.s("status") == "replaced" {
+        return "⚡ switched to a faster version".to_string();
+    }
     if a.s("status") == "failed" {
         return format!("{}  ✗ failed at {}%", render_bar(pct), pct);
     }
@@ -67,7 +70,7 @@ fn bars_block(attempts: &[Value], timeleft: &str, importing: bool) -> String {
         let hidden = attempts.len() - (MAX_ATTEMPT_LINES - 1);
         (
             &attempts[hidden..],
-            format!("…+{} earlier failed attempt(s)\n", hidden),
+            format!("…+{} earlier attempt(s)\n", hidden),
         )
     };
     let lines: Vec<String> = shown
@@ -204,7 +207,7 @@ pub fn build_embed(
             c.lines.join("\n")
         );
     } else {
-        let n = attempts.len();
+        let n = attempts.iter().filter(|a| a.s("status") != "replaced").count();
         desc = match state {
             "downloading" => {
                 let head = if n > 1 {
@@ -259,4 +262,34 @@ pub fn build_embed(
     }
     // content:"" so editing a pre-embed (plain-text) message clears the old text.
     json!({ "content": "", "embeds": [embed] })
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    #[test]
+    fn collapsed_mixed_attempts_do_not_call_replacements_failures() {
+        let mut a = vec![json!({"pct":20,"status":"replaced"}); 7];
+        a.push(json!({"pct":30,"status":"failed"}));
+        a.push(json!({"pct":5,"status":"active"}));
+        let bars = bars_block(&a, "", false);
+        assert!(bars.contains("earlier attempt(s)"));
+        assert!(!bars.contains("earlier failed"));
+        let ready =
+            build_embed("ready", "Movie", None, None, &a, "", false, None, None).to_string();
+        assert!(ready.contains("after 2 tries"));
+    }
+    #[test]
+    fn intentional_switch_is_not_failed_or_extra_try() {
+        let a = vec![json!({"pct":80,"status":"replaced"}), json!({"pct":10,"status":"active"})];
+        let bars = bars_block(&a, "", false);
+        assert!(bars.contains("⚡ switched to a faster version"));
+        assert!(!bars.contains("failed"));
+        let ready =
+            build_embed("ready", "Movie", None, None, &a, "", false, None, None).to_string();
+        assert!(!ready.contains("tries"));
+        let active =
+            build_embed("downloading", "Movie", None, None, &a, "", false, None, None).to_string();
+        assert!(!active.contains("attempt 2"));
+    }
 }

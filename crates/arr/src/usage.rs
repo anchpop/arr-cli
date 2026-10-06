@@ -18,6 +18,11 @@ sonarr-anime, so a bare `arr sonarr status <anime>` is the classic false miss.
   put the TITLE FIRST, flags after it. A numeric id still needs its service
   (ids are only unique within one instance). Ambiguous titles list candidates.
 
+  arr radarr faster '<item>' [--dry-run | --yes]
+        preview a safe smaller SAB release with --dry-run; --yes switches.
+        Cancels the old download only once the new one receives bytes.
+        Never blocklists the old release; keeps the same movie and tags.
+
   arr where <title>               WHERE IS THIS? one call, whole pipeline:
         which service holds it, what's on disk (per-season for shows), any
         search still running, what's in the arr + SAB queues, the Seerr request

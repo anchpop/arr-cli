@@ -13,6 +13,7 @@ mod acquire;
 mod book;
 mod browse;
 mod disk;
+mod faster;
 mod harvest;
 mod integrations;
 mod locate;
@@ -140,6 +141,7 @@ pub fn run_svc_command(svc: &str, cmd: &str, args: &[String]) {
                 "seasons" => browse::cmd_seasons(svc, args),
                 "releases" => browse::cmd_releases(svc, args),
                 "grab" => acquire::cmd_grab(svc, args),
+                "faster" => faster::cmd_faster(svc, args),
                 "monitor" => browse::cmd_monitor(svc, args),
                 "queue" => browse::cmd_queue(svc, args),
                 "queue-rm" => acquire::cmd_queue_rm(svc, args),

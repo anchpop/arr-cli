@@ -498,6 +498,7 @@ pub fn cmd_status(svc: &str, args: &[String]) {
                     println!("{}", ln);
                 }
                 audit_warn(svc, s.i("id"), Some(s));
+                crate::faster::report_item(svc, s.i("id"));
             }
         }
     } else if svc == "radarr" {
@@ -524,6 +525,7 @@ pub fn cmd_status(svc: &str, args: &[String]) {
             );
             if matches.len() == 1 {
                 audit_warn(svc, m.i("id"), Some(m));
+                crate::faster::report_item(svc, m.i("id"));
             }
         }
     } else {
@@ -926,6 +928,7 @@ pub fn cmd_queue(svc: &str, args: &[String]) {
             lbls,
             py_get(r, "title")
         );
+        crate::faster::print_eta(r);
         if !r.s("errorMessage").is_empty() {
             println!("        err: {}", r.s("errorMessage"));
         }

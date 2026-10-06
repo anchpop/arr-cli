@@ -245,13 +245,19 @@ fn http10_get(port: u16, path: &str, timeout: u64) -> Result<String, String> {
 
 /// Fallible SAB API call (same URL shape as arr-api's sab_api).
 fn sab_try_get(mode: &str, params: &[(&str, &str)]) -> Result<Value, String> {
+    sab_try_get_timeout(mode, params, 120)
+}
+
+pub(crate) fn sab_try_get_timeout(
+    mode: &str, params: &[(&str, &str)], timeout: u64,
+) -> Result<Value, String> {
     let key = arr_api::sab_key();
     let mut q: Vec<(&str, &str)> = vec![("mode", mode), ("output", "json"), ("apikey", &key)];
     q.extend_from_slice(params);
     let body = http10_get(
         arr_api::SAB_PORT,
         &format!("/api/?{}", arr_api::http::form_encode(&q)),
-        120,
+        timeout,
     )?;
     match serde_json::from_str(&body) {
         Ok(v) => Ok(v),
@@ -555,6 +561,7 @@ pub fn report_first_grab(svc: &str, iid: i64, is_series: bool, timeout: i64) -> 
             }
             let owned: Vec<Value> = mine.into_iter().cloned().collect();
             promote_downloads(&owned);
+            crate::faster::report(svc, iid, &owned, true);
             return true;
         }
         // Narrate the search commands doing the actual work: print each one
@@ -716,6 +723,13 @@ fn ensure_monitored(svc: &str, iid: i64, flags: &Flags, dry: bool) -> bool {
     true
 }
 
+/// Submit exactly one arr-ranked candidate through the arr search cache.
+/// Kept fallible so callers can recover without exiting a swap transaction.
+pub(crate) fn submit_release(svc: &str, release: &Value) -> Result<Option<Value>, ApiError> {
+    let body = json!({"guid": release.get("guid"), "indexerId": release.get("indexerId")});
+    try_api(svc, "POST", "/release", Some(&body), 120)
+}
+
 pub fn cmd_grab(svc: &str, args: &[String]) {
     if svc == "prowlarr" {
         return cmd_prowlarr_grab(args);
@@ -810,6 +824,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             println!("{}{}", if ok { "added: " } else { "FAILED: " }, r.s("title"));
         }
         println!("({} usenet release(s) sent to SAB cat={})", n, svc);
+        if n > 0 && !dry && !flags.has("--no-wait") {
+            if let Ok(iid) = crate::disk::resolve_soft(svc, &rest[0]) {
+                report_first_grab(svc, iid, svc.starts_with("sonarr"), 60);
+            }
+        }
         if n == 0 {
             if let Some(m) = &matchf {
                 println!("no candidate release matched '{}' — check the exact title with `arr {} releases`", m, svc);
@@ -933,11 +952,7 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             println!("DRY push: {}", r.s("title"));
             continue;
         }
-        let body = json!({
-            "guid": r.get("guid").cloned().unwrap_or(Value::Null),
-            "indexerId": r.get("indexerId").cloned().unwrap_or(Value::Null),
-        });
-        match try_api(svc, "POST", "/release", Some(&body), 120) {
+        match submit_release(svc, r) {
             Ok(_) => println!("pushed: {}", r.s("title")),
             Err(e) => {
                 // Python catches the SystemExit from die() here — the die
@@ -948,6 +963,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
         }
     }
     println!("({} release(s) processed)", count);
+    if count > 0 && !dry && !flags.has("--no-wait") {
+        if let Ok(iid) = crate::disk::resolve_soft(svc, &rest[0]) {
+            report_first_grab(svc, iid, svc.starts_with("sonarr"), 60);
+        }
+    }
     if count == 0 {
         if let Some(m) = &matchf {
             println!("no candidate release matched '{}' — check the exact title with `arr {} releases`", m, svc);

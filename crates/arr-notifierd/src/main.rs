@@ -147,40 +147,54 @@ fn tag_requester_map(instn: &str, valid_discord: &HashSet<String>) -> HashMap<i6
     out
 }
 
-/// Fold this poll into the per-download-attempt history. A download whose
-/// queue downloadId set is disjoint from the one we were tracking is a NEW
-/// release Radarr/Sonarr grabbed after the previous one failed — so the
-/// previous attempt is marked failed and a new bar begins.
+/// Fold queue evolution into attempts. Keep the current attempt's identities
+/// through an overlap (old -> old+new -> new), rather than forgetting old at
+/// the middle poll. The faster command records downloadIgnored to distinguish
+/// its intentional replacement from a failed release.
 fn evolve_attempts(
     mut attempts: Vec<Value>,
     stored_dlids: &BTreeSet<String>,
     g: &Group,
+    ignored: Option<&BTreeSet<String>>,
 ) -> (Vec<Value>, BTreeSet<String>) {
     let new_dlids = g.dlids.clone();
     let pct = g.pct;
     if attempts.is_empty() {
         return (vec![json!({"pct": pct, "status": "active"})], new_dlids);
     }
-    let replaced =
-        !new_dlids.is_empty() && !stored_dlids.is_empty() && new_dlids.is_disjoint(stored_dlids);
+    let removed: BTreeSet<_> = stored_dlids.difference(&new_dlids).cloned().collect();
+    let replaced = !new_dlids.is_empty()
+        && !stored_dlids.is_empty()
+        && (new_dlids.is_disjoint(stored_dlids) || (g.kind == "movie" && !removed.is_empty()));
+    // Retry history after transient errors rather than manufacture a failure.
+    if replaced && g.kind == "movie" && ignored.is_none() {
+        return (attempts, stored_dlids.clone());
+    }
     let last_status = attempts.last().map(|a| a.s("status").to_string()).unwrap_or_default();
     if replaced || last_status != "active" {
         if last_status == "active" {
-            // superseded before importing ⇒ it failed
-            attempts.last_mut().unwrap()["status"] = json!("failed");
+            let intentional = replaced
+                && ignored
+                    .is_some_and(|ids| removed.iter().all(|id| ids.contains(&id.to_lowercase())));
+            attempts.last_mut().unwrap()["status"] =
+                json!(if intentional { "replaced" } else { "failed" });
         }
         attempts.push(json!({"pct": pct, "status": "active"}));
     } else {
         let last = attempts.last_mut().unwrap();
-        let newpct = last.i("pct").max(pct);
-        last["pct"] = json!(newpct);
+        last["pct"] = json!(last.i("pct").max(pct));
     }
-    let dlids = if new_dlids.is_empty() {
-        stored_dlids.clone()
-    } else {
-        new_dlids
-    };
+    let dlids = if replaced || stored_dlids.is_empty() { new_dlids } else { stored_dlids.clone() };
     (attempts, dlids)
+}
+
+fn ignored_downloads(history: &[Value]) -> BTreeSet<String> {
+    history
+        .iter()
+        .filter(|r| r.s("eventType") == "downloadIgnored")
+        .map(|r| r.s("downloadId").to_lowercase())
+        .filter(|id| !id.is_empty())
+        .collect()
 }
 
 /// Per-episode status for the season chart. An episode in the queue that
@@ -468,7 +482,12 @@ fn handle(con: &Connection, key: &str, discord_id: &str, title: &str, g: &Group)
         ep_json = Some(serde_json::to_string(&ep_status).unwrap_or_default());
     } else {
         let attempts = parse_attempts(row.as_ref().and_then(|r| r.4.as_deref()));
-        let (a, d) = evolve_attempts(attempts, &stored_dlids, g);
+        let changed = !g.dlids.is_empty() && stored_dlids.iter().any(|id| !g.dlids.contains(id));
+        let ignored = if instn == "radarr" && changed {
+            arr_get(&instn, &format!("history/movie?movieId={iid_str}"))
+                .and_then(|h| h.as_array().map(|rows| ignored_downloads(rows)))
+        } else { Some(BTreeSet::new()) };
+        let (a, d) = evolve_attempts(attempts, &stored_dlids, g, ignored.as_ref());
         pct = a.last().map(|x| x.i("pct")).unwrap_or(0);
         payload = build_embed(
             "downloading",
@@ -1763,4 +1782,68 @@ fn run() -> i32 {
 
 fn main() {
     std::process::exit(run());
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+    fn group(ids: &[&str], pct: i64) -> Group {
+        Group {
+            size: 100.0,
+            left: (100 - pct) as f64,
+            importing: false,
+            timeleft: String::new(),
+            title: None,
+            kind: "movie",
+            year: None,
+            poster: None,
+            tmdb: String::new(),
+            imdb: String::new(),
+            tvdb: String::new(),
+            episodes: BTreeSet::new(),
+            dlids: ids.iter().map(|s| s.to_string()).collect(),
+            ep_state: BTreeMap::new(),
+            seasons: BTreeMap::new(),
+            pct,
+        }
+    }
+    #[test]
+    fn intentional_overlap_resets_bar_without_failure() {
+        let ignored =
+            ignored_downloads(&[json!({"eventType":"downloadIgnored","downloadId":"old"})]);
+        let (a, d) =
+            evolve_attempts(vec![], &BTreeSet::new(), &group(&["old"], 80), Some(&ignored));
+        let (a, d) = evolve_attempts(a, &d, &group(&["old", "new"], 45), Some(&ignored));
+        assert_eq!(a.len(), 1);
+        assert_eq!(d.len(), 1);
+        let (a, d) = evolve_attempts(a, &d, &group(&["new"], 10), Some(&ignored));
+        assert_eq!(a[0].s("status"), "replaced");
+        assert_eq!(a[1].i("pct"), 10);
+        let (a, d) = evolve_attempts(a, &d, &group(&["new"], 20), Some(&ignored));
+        assert_eq!(a.len(), 2);
+        let (a, _) = evolve_attempts(a, &d, &group(&["retry"], 5), Some(&ignored));
+        assert_eq!(a[0].s("status"), "replaced");
+        assert_eq!(a[1].s("status"), "failed");
+        assert_eq!(a[2].i("pct"), 5);
+    }
+    #[test]
+    fn genuine_failure_and_missing_history() {
+        let (a, d) =
+            evolve_attempts(vec![], &BTreeSet::new(), &group(&["old"], 80), Some(&BTreeSet::new()));
+        let (pending, ids) = evolve_attempts(a.clone(), &d, &group(&["new"], 10), None);
+        assert_eq!(pending, a);
+        assert_eq!(ids, d);
+        let (a, _) = evolve_attempts(a, &d, &group(&["new"], 10), Some(&BTreeSet::new()));
+        assert_eq!(a[0].s("status"), "failed");
+        assert!(ignored_downloads(&[json!({"eventType":"downloadFailed","downloadId":"old"})])
+            .is_empty());
+    }
+    #[test]
+    fn first_poll_overlap_then_removal() {
+        let ignored = BTreeSet::from(["old".to_string()]);
+        let (a, d) =
+            evolve_attempts(vec![], &BTreeSet::new(), &group(&["old", "new"], 50), Some(&ignored));
+        let (a, _) = evolve_attempts(a, &d, &group(&["new"], 15), Some(&ignored));
+        assert_eq!(a[0].s("status"), "replaced");
+    }
 }
