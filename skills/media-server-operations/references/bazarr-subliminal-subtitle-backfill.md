@@ -44,6 +44,14 @@ Use this when a user reports missing English subtitles for specific movies or sh
    curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
    ```
 
+## Manual Bazarr candidates below the automatic score cutoff
+
+- Query `GET /api/providers/episodes?episodeid=<Sonarr episode ID>` before trying a different downloader. Real candidates can fail the automatic score cutoff because source, release group and codecs do not match. Check English language, series, season, episode and year; do not globally lower the cutoff.
+- Submit the selected candidate to `POST /api/providers/episodes` with explicit `seriesid`, `episodeid`, `hi`, `forced`, `original_format`, `provider`, and the opaque `subtitle` value from GET. Boolean strings are `True`/`False`. HTTP 204 only queues work: verify `/api/system/jobs`, `/api/episodes/history`, sidecar files and `/api/episodes` readback.
+- For release-mismatched timing, back up newly downloaded sidecars outside the library, then request speech-activity synchronization (not transcription or translation) through `PATCH /api/subtitles`: `action=sync`, `language=en`, `path=<sidecar>`, `type=episode`, `id=<Sonarr episode ID>`, `forced=False`, `hi=<actual flag>`, `reference=a:0`, `max_offset_seconds=120`, `no_fix_framerate=True`, `gss=False`. Wait for async jobs and inspect history's actual offsets plus changed file timestamps. Removed opening titles can require approximately 30 seconds of adjustment.
+- Refresh affected Jellyfin episode IDs, without replacing metadata/images, and read `MediaStreams` back. Require English external subtitles on each repaired item; preserve existing good sidecars and media.
+- `/episodes/history` may ignore unsupported `seriesid` filtering; filter returned rows by `sonarrSeriesId` before reporting. If the tool-kernel environment lacks a key but `arr` works, call arr's existing API helper in the terminal environment without printing credentials.
+
 ## Pitfalls
 
 - Do not read or expose subtitle-provider credentials. If Bazarr's configured subscription exists but its API key/config is not available to Hermes, use direct safe tooling and report any remaining item that needs Bazarr UI/subscription intervention.
