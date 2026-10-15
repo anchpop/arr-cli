@@ -726,7 +726,13 @@ fn ensure_monitored(svc: &str, iid: i64, flags: &Flags, dry: bool) -> bool {
 /// Submit exactly one arr-ranked candidate through the arr search cache.
 /// Kept fallible so callers can recover without exiting a swap transaction.
 pub(crate) fn submit_release(svc: &str, release: &Value) -> Result<Option<Value>, ApiError> {
-    let body = json!({"guid": release.get("guid"), "indexerId": release.get("indexerId")});
+    let mut body = json!({"guid": release.get("guid"), "indexerId": release.get("indexerId")});
+    // Radarr only fills the movie in when the release title parses; a title it
+    // can't match (original-language names, odd naming) is refused with
+    // "Unable to find matching movie" unless the movie is supplied.
+    if svc == "radarr" && release.i("movieId") != 0 {
+        body["movieId"] = release["movieId"].clone();
+    }
     try_api(svc, "POST", "/release", Some(&body), 120)
 }
 
@@ -934,6 +940,8 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
         None,
         SEARCH_TIMEOUT,
     );
+    // The search was for one movie, so every release it returned is for it.
+    let movie_id = (svc == "radarr").then(|| resolve_id(svc, &rest[0]));
     let mut seen: HashSet<String> = HashSet::new();
     let mut count = 0;
     for r in items(&rels) {
@@ -952,7 +960,11 @@ pub fn cmd_grab(svc: &str, args: &[String]) {
             println!("DRY push: {}", r.s("title"));
             continue;
         }
-        match submit_release(svc, r) {
+        let mut r = r.clone();
+        if let Some(id) = movie_id {
+            r["movieId"] = json!(id);
+        }
+        match submit_release(svc, &r) {
             Ok(_) => println!("pushed: {}", r.s("title")),
             Err(e) => {
                 // Python catches the SystemExit from die() here — the die
