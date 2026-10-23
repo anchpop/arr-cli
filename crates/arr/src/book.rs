@@ -29,6 +29,36 @@ fn now_secs() -> f64 {
         .as_secs_f64()
 }
 
+/// The numbers in a title that identify *which* book it is: series volume
+/// numbers, mostly. Ignores 1 (book 1 is tagged "Title 1: …" as often as not)
+/// and anything year-shaped, unless the requested title itself has that year.
+fn title_numbers(title: &str, requested: &str) -> Vec<String> {
+    let nums = |s: &str| -> Vec<String> {
+        // Whole tokens only, so "2nd edition" isn't read as volume 2.
+        s.split(|c: char| !c.is_alphanumeric())
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+            .map(|n| n.trim_start_matches('0').to_string())
+            .collect()
+    };
+    let wanted = nums(requested);
+    let mut v: Vec<String> = nums(title)
+        .into_iter()
+        .filter(|n| !n.is_empty() && n != "1")
+        .filter(|n| wanted.contains(n) || !(n.len() == 4 && n.starts_with(['1', '2'])))
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Does an Anna's Archive release title look like the requested book, rather
+/// than another volume of the same series? AA's title search is loose: asking
+/// for "Mark of the Fool" returned only "Mark of the Fool 3: …" (2026-10-23),
+/// and taking it blindly put book 3 in the library under book 1's name.
+fn release_matches(release_title: &str, requested: &str) -> bool {
+    title_numbers(release_title, requested) == title_numbers(requested, requested)
+}
+
 fn looks_like_isbn(q: &str) -> bool {
     let digits: String = q.chars().filter(|c| c.is_ascii_digit()).collect();
     (digits.len() == 10 || digits.len() == 13) && q.chars().all(|c| c.is_ascii_digit() || c == '-')
@@ -268,9 +298,24 @@ pub fn cmd_book_add(args: &[String]) {
         );
         std::process::exit(2);
     }
-    let releases = rel.a("releases");
-    if releases.is_empty() {
+    let all_releases = rel.a("releases");
+    if all_releases.is_empty() {
         eprintln!("no releases found for \"{}\" on Anna's Archive/Libgen", title);
+        std::process::exit(1);
+    }
+    let releases: Vec<&Value> = all_releases
+        .iter()
+        .filter(|r| release_matches(r.s("title"), &title))
+        .collect();
+    if releases.is_empty() {
+        eprintln!(
+            "no release matching \"{}\" on Anna's Archive/Libgen — only other volumes:",
+            title
+        );
+        for r in all_releases {
+            eprintln!("  {} | {} | {}", r.s("format"), r.s("size"), r.s("title"));
+        }
+        eprintln!("(try usenet: arr prowlarr search '<title>')");
         std::process::exit(1);
     }
 
@@ -416,5 +461,24 @@ pub fn dispatch(cmd: &str, args: &[String]) {
         "add" => cmd_book_add(args),
         "status" => cmd_book_status(args),
         c => die(&format!("unknown book command '{}'", c)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::release_matches;
+
+    #[test]
+    fn release_must_be_the_requested_volume() {
+        let book1 = "Mark of the Fool";
+        assert!(release_matches("Mark of the Fool: A Progression Fantasy Epic", book1));
+        assert!(release_matches("Herald of Shalia 1: Herald of Shalia", "Herald of Shalia"));
+        assert!(!release_matches("Mark of the Fool 3: A Progression Fantasy Epic", book1));
+        assert!(release_matches("Mark of the Fool 03 (2023)", "Mark of the Fool 3"));
+        assert!(!release_matches("Mark of the Fool", "Mark of the Fool 3"));
+        assert!(release_matches("1984", "1984"));
+        assert!(release_matches("Dune (2019 edition)", "Dune"));
+        assert!(release_matches("Dune (2nd edition)", "Dune"));
+        assert!(release_matches("Herald of Shalia", "Herald of Shalia 1"));
     }
 }
