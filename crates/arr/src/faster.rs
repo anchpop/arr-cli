@@ -11,6 +11,9 @@ const MIN_RECEIVED_MB: f64 = 100.0;
 const MAX_MISSING_FRACTION: f64 = 0.05;
 const MAX_TRIES: usize = 5;
 const SPEED_SAMPLE_SECONDS: u64 = 30;
+/// SAB opens its 50 connections over the first minute of a job, so speed
+/// (and every ETA derived from it) reads several times too slow until then.
+const WARMUP_SECONDS: i64 = 60;
 const JUNK_FORMAT_SCORE: i64 = -10_000;
 type Result<T> = std::result::Result<T, String>;
 
@@ -148,7 +151,19 @@ fn eta(left: f64, speed: Option<f64>) -> String {
         })
         .unwrap_or_else(|| "unknown (no measured download speed)".into())
 }
+fn age(r: &Value) -> Option<i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(now.as_secs() as i64 - crate::browse::iso_epoch(r.s("added"))?)
+}
 pub(crate) fn print_eta(r: &Value) {
+    if let Some(a) = age(r).filter(|a| *a < WARMUP_SECONDS) {
+        println!(
+            "        download ETA: still connecting (started {a}s ago); check again in a minute"
+        );
+        return;
+    }
     let label = seconds(r)
         .map(|s| format!("~{}", crate::browse::fmt_age(s as i64)))
         .unwrap_or_else(|| "unknown (queued, paused or no measured speed)".into());
@@ -241,6 +256,21 @@ fn choice(s: &Snapshot, r: &Value, iid: i64) {
 }
 /// Only acquisition searches indexers; status/where use cheap queue ETA + a pointer.
 pub(crate) fn report(svc: &str, iid: i64, records: &[Value], acquisition: bool) {
+    // add/grab land here seconds after the grab: wait out the warm-up so the
+    // ETA and the faster offer aren't computed from a half-connected job.
+    let fresh;
+    let records = match records.iter().filter_map(age).min() {
+        Some(a) if acquisition && a < WARMUP_SECONDS => {
+            println!(
+                "  (waiting {}s for the download to reach full speed before estimating)",
+                WARMUP_SECONDS - a
+            );
+            std::thread::sleep(Duration::from_secs((WARMUP_SECONDS - a) as u64));
+            fresh = queue_rows(svc, iid);
+            &fresh[..]
+        }
+        _ => records,
+    };
     for r in records {
         print_eta(r);
     }
@@ -284,21 +314,23 @@ pub(crate) fn report(svc: &str, iid: i64, records: &[Value], acquisition: bool) 
         Err(_) => println!("  faster lookup unavailable; retry: arr radarr faster {iid} --dry-run"),
     }
 }
-pub(crate) fn report_item(svc: &str, iid: i64) {
+fn queue_rows(svc: &str, iid: i64) -> Vec<Value> {
     let field = if svc.starts_with("sonarr") {
         "seriesId"
     } else {
         "movieId"
     };
-    if let Ok(Some(q)) = try_api(svc, "GET", "/queue?pageSize=1000", None, 10) {
-        let rows: Vec<_> = q
-            .a("records")
-            .iter()
-            .filter(|r| r.i(field) == iid)
-            .cloned()
-            .collect();
-        report(svc, iid, &rows, false);
-    }
+    let Ok(Some(q)) = try_api(svc, "GET", "/queue?pageSize=1000", None, 10) else {
+        return vec![];
+    };
+    q.a("records")
+        .iter()
+        .filter(|r| r.i(field) == iid)
+        .cloned()
+        .collect()
+}
+pub(crate) fn report_item(svc: &str, iid: i64) {
+    report(svc, iid, &queue_rows(svc, iid), false);
 }
 fn replacement(iid: i64, s: &Snapshot) -> Result<Option<Value>> {
     let rows: Vec<_> = queue(iid)?
