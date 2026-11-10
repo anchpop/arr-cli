@@ -37,8 +37,8 @@ nix shell nixpkgs#ffmpeg -c ffprobe -v error \
 7. Trigger Jellyfin refresh and verify Jellyfin sees the movie and subtitle stream:
 
 ```sh
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
-curl -fsS "http://localhost:8096/Items?api_key=$JELLYFIN_API_KEY&Recursive=true&SearchTerm=<url-encoded-title>&Limit=20&Fields=Path,MediaStreams" \
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" "http://localhost:8096/Items?Recursive=true&SearchTerm=<url-encoded-title>&Limit=20&Fields=Path,MediaStreams" \
   | jq -r '.Items[] | select(.Type=="Movie" and .ProductionYear==<year>) | [.Name,.ProductionYear,.Path,(.MediaStreams[]? | select(.Type=="Subtitle") | ((.Language//"")+":"+(.Title//.DisplayTitle//"")))] | @tsv'
 ```
 

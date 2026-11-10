@@ -14,17 +14,17 @@ Use this when a user says a specific Jellyfin episode/show "isn't loading", spin
 Find the active user/session and current item:
 
 ```sh
-curl -fsS "http://localhost:8096/Sessions?api_key=$JELLYFIN_API_KEY" \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" "http://localhost:8096/Sessions" \
   | jq '.[] | {UserName,Client,DeviceName,NowPlayingItem,PlayState,TranscodingInfo,LastActivityDate}'
 ```
 
 Verify Jellyfin sees the series/episodes and paths:
 
 ```sh
-SERIES_ID=$(curl -fsS "http://localhost:8096/Items?api_key=$JELLYFIN_API_KEY&Recursive=true&SearchTerm=<title>&Limit=20" \
+SERIES_ID=$(curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" "http://localhost:8096/Items?Recursive=true&SearchTerm=<title>&Limit=20" \
   | jq -r '.Items[] | select(.Type=="Series" and .Name=="<exact title>") | .Id' | head -1)
 
-curl -fsS "http://localhost:8096/Shows/$SERIES_ID/Episodes?api_key=$JELLYFIN_API_KEY&Fields=Path,MediaSources&Limit=200" \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" "http://localhost:8096/Shows/$SERIES_ID/Episodes?Fields=Path,MediaSources&Limit=200" \
   | jq -r '.Items[] | [.ParentIndexNumber,.IndexNumber,.Name,(.Path//""),((.MediaSources//[])|length)] | @tsv'
 ```
 
@@ -62,7 +62,7 @@ If the test fails with decode errors, treat the media file as bad even if Jellyf
    ```
 5. Trigger a Jellyfin refresh and verify Jellyfin's episode path now points to the replacement:
    ```sh
-   curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+   curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
    ```
 
 ## Load-related pitfall

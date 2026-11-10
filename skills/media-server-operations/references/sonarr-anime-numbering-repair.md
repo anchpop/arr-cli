@@ -56,7 +56,7 @@ Use this when an anime series is incomplete or import-blocked because release fi
 
 8. Trigger Jellyfin refresh when done:
    ```sh
-   curl -fsS -X POST 'http://localhost:8096/Library/Refresh' -H "X-Emby-Token: $JELLYFIN_API_KEY"
+   curl -fsS -X POST 'http://localhost:8096/Library/Refresh' -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\""
    ```
 
 ## Pitfalls

@@ -63,7 +63,7 @@ rm -f "$BAK"
 6. Re-audit every episode in the affected season and verify all default audio tracks are English. Then trigger Jellyfin refresh:
 
 ```sh
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
 ```
 
 ## Reporting

@@ -186,7 +186,13 @@ pub fn sab_delete_job(slot: &Value) -> bool {
     r.is_object() && r.at(&["status"]).as_bool() == Some(true)
 }
 
-/// Jellyfin (X-Emby-Token). `soft` returns None on any error instead of dying.
+/// Jellyfin's `Authorization` header value. Jellyfin 12 dropped the legacy
+/// `X-Emby-Token` header and `api_key` query param; unauthenticated calls 401.
+pub fn jf_auth(key: &str) -> String {
+    format!("MediaBrowser Token=\"{}\"", key)
+}
+
+/// Jellyfin. `soft` returns None on any error instead of dying.
 pub fn jf_api(
     path: &str,
     params: &[(&str, &str)],
@@ -196,7 +202,7 @@ pub fn jf_api(
 ) -> Option<Value> {
     let qs = if params.is_empty() { String::new() } else { format!("?{}", form_encode(params)) };
     let url = format!("http://localhost:{}{}{}", JELLYFIN_PORT, path, qs);
-    let req = agent().request(method, &url).set("X-Emby-Token", &jf_key());
+    let req = agent().request(method, &url).set("Authorization", &jf_auth(&jf_key()));
     match run(req, None, timeout) {
         Ok(v) => v,
         Err(_) if soft => None,

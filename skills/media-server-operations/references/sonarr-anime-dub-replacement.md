@@ -64,7 +64,7 @@ arr sonarr-anime raw GET '/command/<id>' | jq '{id,name,status,message}'
 arr sonarr-anime seasons '<Sonarr title>'
 arr sonarr-anime files '<Sonarr title>' --full
 arr sonarr-anime raw DELETE '/queue/<queueId>?removeFromClient=true&blocklist=false'
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null && echo refreshed
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null && echo refreshed
 ```
 
 ## Reporting to users

@@ -43,16 +43,16 @@ bash ./deploy.sh
 Verify plugin load and endpoints:
 
 ```sh
-curl -fsS -H "X-Emby-Token: $JELLYFIN_API_KEY" http://localhost:8096/Plugins \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Plugins \
   | jq -r '.[] | select(.Name=="Letterboxd") | "\(.Name) v\(.Version) [\(.Status)]"'
 
-curl -fsS -X POST -H "X-Emby-Token: $JELLYFIN_API_KEY" \
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" \
   http://localhost:8096/Letterboxd/Sync | jq .
 
-curl -fsS -H "X-Emby-Token: $JELLYFIN_API_KEY" \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" \
   'http://localhost:8096/Letterboxd/Search?query=Ratatouille&limit=2' | jq .
 
-curl -fsS -H "X-Emby-Token: $JELLYFIN_API_KEY" http://localhost:8096/ScheduledTasks \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/ScheduledTasks \
   | jq '.[] | select(.Key=="LetterboxdSync") | {Name,Key,State,LastExecutionResult,Triggers}'
 ```
 
@@ -72,21 +72,21 @@ Do not edit Jellyfin's XML config file directly from the Hermes file tool; the d
    ```
 2. Fetch the current plugin id/config:
    ```sh
-   PLUGIN_ID=$(curl -fsS -H "X-Emby-Token: $JELLYFIN_API_KEY" http://localhost:8096/Plugins \
+   PLUGIN_ID=$(curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Plugins \
      | jq -r '.[] | select(.Name=="Letterboxd") | .Id')
-   curl -fsS -H "X-Emby-Token: $JELLYFIN_API_KEY" \
+   curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" \
      "http://localhost:8096/Plugins/$PLUGIN_ID/Configuration" | jq .
    ```
 3. POST the full updated config JSON (including all existing users; do not send a partial list):
    ```sh
-   curl -fsS -X POST -H "X-Emby-Token: $JELLYFIN_API_KEY" -H 'Content-Type: application/json' \
+   curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" -H 'Content-Type: application/json' \
      --data @/path/to/letterboxd-config-update.json \
      "http://localhost:8096/Plugins/$PLUGIN_ID/Configuration"
    ```
 4. Build/deploy/restart if plugin code changed, then verify the live config after restart. If the C# `Users` default list is non-empty, Jellyfin XML deserialization can append saved users onto defaults and duplicate entries. Keep code defaults empty and store current mappings in live config / `config.example.json`.
 5. Run sync and verify per-user counts/errors:
    ```sh
-   curl -fsS -X POST -H "X-Emby-Token: $JELLYFIN_API_KEY" http://localhost:8096/Letterboxd/Sync | jq .
+   curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Letterboxd/Sync | jq .
    jq -r '.users[] | "\(.displayName): \(.letterboxdUsername) entries=\(.entries|length) error=\(.error // "none")"' \
      /data/.nixflix/jellyfin/plugins/Jellyfin.Plugin.Letterboxd/letterboxd-cache.json
    ```

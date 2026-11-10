@@ -48,7 +48,7 @@ nix shell nixpkgs#ffmpeg-headless -c ffprobe -v error -f srt \
 6. Refresh Jellyfin and verify via the API that the new subtitle is visible as external English forced:
 
 ```bash
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
 # Then inspect MediaStreams for Language=eng, IsExternal=true, IsForced=true.
 ```
 

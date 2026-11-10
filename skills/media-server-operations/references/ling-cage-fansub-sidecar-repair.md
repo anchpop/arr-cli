@@ -80,13 +80,13 @@ mv -f "$BAK" /data/downloads/hermes-backups/ling-cage/
 1. Refresh Jellyfin:
 
 ```bash
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
 ```
 
 2. Search by path/title, not just exact display name. Jellyfin may show the series as `Spirit Cage: Incarnation 2` even though the filesystem path is `/data/media/anime/Ling Cage`.
 
 ```bash
-curl -fsS "http://localhost:8096/Items?api_key=$JELLYFIN_API_KEY&Recursive=true&SearchTerm=Cage&Limit=100&Fields=Path" \
+curl -fsS -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" "http://localhost:8096/Items?Recursive=true&SearchTerm=Cage&Limit=100&Fields=Path" \
   | jq -r '.Items[] | select((.Path//"")|contains("/data/media/anime/Ling Cage")) | [.Type,.Name,.Id,(.Path//"")] | @tsv'
 ```
 

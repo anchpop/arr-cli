@@ -63,7 +63,7 @@ After each fix:
 arr <service> status '<title>'
 arr <service> history '<title>' | head -20
 arr <service> queue '<distinct title words>' || true
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
 ```
 
 Report: fixed/imported, actively queued/downloading, failed with no safe alternate, or skipped due to risky mapping.

@@ -174,9 +174,9 @@ fn try_jf_refresh() -> bool {
     let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(60)));
     let req = format!(
-        "POST /Library/Refresh HTTP/1.1\r\nHost: localhost:{}\r\nX-Emby-Token: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "POST /Library/Refresh HTTP/1.1\r\nHost: localhost:{}\r\nAuthorization: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         arr_api::JELLYFIN_PORT,
-        arr_api::jf_key()
+        arr_api::http::jf_auth(&arr_api::jf_key())
     );
     if s.write_all(req.as_bytes()).is_err() {
         return false;

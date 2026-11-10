@@ -55,8 +55,8 @@ Use this for Alex (`alexandriasage` / Jellyfin `alexandria` / Discord `162299305
    - `nix shell nixpkgs#python3 nixpkgs#python3Packages.requests nixpkgs#python3Packages.beautifulsoup4 --command python scripts/import_letterboxd_export.py <zip> --user 'Alex:alexandriasage:alexandria:162299305300852737' --merge-cache /data/.nixflix/jellyfin/plugins/Jellyfin.Plugin.Letterboxd/letterboxd-cache.json`
    - For other users, replace the `--user` tuple: `DisplayName:letterboxdUsername:jellyfinUserName:discordUserId`.
 5. Trigger plugin sync and Jellyfin refresh, keeping API keys out of chat:
-   - `curl -fsS -X POST -H "X-Emby-Token: $JELLYFIN_API_KEY" http://localhost:8096/Letterboxd/Sync`
-   - `curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY"`
+   - `curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Letterboxd/Sync`
+   - `curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh`
 6. Verify live state:
    - `/Letterboxd/Users` includes the user and their imported entry count is well above RSS-only when the export is full.
    - `/Letterboxd/Film/<tmdbId>` returns at least one known imported title from that user's export.

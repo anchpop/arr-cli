@@ -41,7 +41,7 @@ Use this when a user reports missing English subtitles for specific movies or sh
    ```
 8. Trigger Jellyfin refresh when done:
    ```sh
-   curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null
+   curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null
    ```
 
 ## Manual Bazarr candidates below the automatic score cutoff

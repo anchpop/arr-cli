@@ -9,7 +9,7 @@ Use this when asked to recommend movies for one trusted user based on another us
   - Cache: `/data/.nixflix/jellyfin/plugins/Jellyfin.Plugin.Letterboxd/letterboxd-cache.json`
   - Cache keys are camelCase (`displayName`, `entries`, `tmdbMovieId`); plugin API responses are PascalCase (`DisplayName`, `Entries`, `TmdbMovieId`).
 - Jellyfin watch history/preferences for the target user:
-  - Find the user ID via `/Users?api_key=$JELLYFIN_API_KEY`.
+  - Find the user ID via `/Users` (header `Authorization: MediaBrowser Token="$JELLYFIN_API_KEY"`; Jellyfin 12 rejects `api_key=`).
   - Fetch played movies with `Users/<id>/Items?Recursive=true&IncludeItemTypes=Movie&Filters=IsPlayed&Fields=Genres,ProductionYear,CommunityRating,Overview,UserData,ProviderIds`.
 - Use TMDb IDs as the join key between Letterboxd, Radarr, and Jellyfin whenever available.
 

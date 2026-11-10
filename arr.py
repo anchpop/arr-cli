@@ -38,7 +38,7 @@ SERVICES = {
 SAB = {"port": 8085, "key": "SABNZBD_API_KEY"}
 # qBittorrent WebUI API (localhost auth bypass enabled), port 8080.
 QBIT = {"port": 8080}
-# Jellyfin media server API, port 8096; auth via the X-Emby-Token header.
+# Jellyfin media server API, port 8096; auth via `Authorization: MediaBrowser Token="<key>"` (Jellyfin 12 dropped X-Emby-Token).
 JELLYFIN = {"port": 8096, "key": "JELLYFIN_API_KEY"}
 # Jellyseerr (request frontend) API, port 5055; auth via X-Api-Key.
 SEERR = {"port": 5055, "key": "SEERR_API_KEY"}
@@ -149,7 +149,7 @@ def jf_api(path, params=None, timeout=60, method="GET", soft=False):
     qs = ("?" + urllib.parse.urlencode(params)) if params else ""
     url = "http://localhost:%d%s%s" % (JELLYFIN["port"], path, qs)
     req = urllib.request.Request(url, method=method)
-    req.add_header("X-Emby-Token", jf_key())
+    req.add_header("Authorization", f'MediaBrowser Token="{jf_key()}"')
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode()

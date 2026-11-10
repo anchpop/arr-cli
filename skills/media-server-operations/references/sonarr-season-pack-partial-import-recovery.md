@@ -61,7 +61,7 @@ arr sonarr seasons '<show>'
 arr sonarr raw GET '/episode?seriesId=<id>&includeEpisodeFile=true' \
   | jq -r 'sort_by(.seasonNumber,.episodeNumber)[] | select(.seasonNumber==<N>) | [.seasonNumber,.episodeNumber,.title,(if .hasFile then "ON_DISK" else "MISSING" end),(.episodeFile.relativePath // "")] | @tsv'
 arr sonarr history '<show>' | head -40
-curl -fsS -X POST "http://localhost:8096/Library/Refresh?api_key=$JELLYFIN_API_KEY" >/dev/null && echo refreshed
+curl -fsS -X POST -H "Authorization: MediaBrowser Token=\"$JELLYFIN_API_KEY\"" http://localhost:8096/Library/Refresh >/dev/null && echo refreshed
 ```
 
 ## Pitfalls

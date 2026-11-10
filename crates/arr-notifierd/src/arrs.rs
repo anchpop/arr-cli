@@ -125,7 +125,7 @@ pub fn jf_get(path: &str, params: &[(&str, &str)]) -> Option<Value> {
     };
     match http_get_json(
         &format!("{}{}{}", JELLYFIN_URL, path, qs),
-        &[("X-Emby-Token", &cfg().jellyfin_key)],
+        &[("Authorization", &arr_api::http::jf_auth(&cfg().jellyfin_key))],
         30,
     ) {
         Ok(v) => v,
@@ -155,7 +155,7 @@ pub fn trigger_jellyfin_scan() {
     }
     let req = ureq::agent()
         .request("POST", &format!("{}/Library/Refresh", JELLYFIN_URL))
-        .set("X-Emby-Token", &cfg().jellyfin_key)
+        .set("Authorization", &arr_api::http::jf_auth(&cfg().jellyfin_key))
         .timeout(Duration::from_secs(30));
     match req.call() {
         Ok(_) => log("triggered Jellyfin library scan (download imported)"),
